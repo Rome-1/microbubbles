@@ -269,11 +269,19 @@ def beamform_iq(
     tx_delays: np.ndarray,  # (angles, channels) seconds
     tx_delays_elev: np.ndarray,  # (angles, rows) seconds
     config: NeutralConfig,
+    *,
+    stream_accumulate: bool = False,
 ) -> tuple[np.ndarray, Grid]:
     """Beamform neutral IQ with the mach experimental kernel.
 
     Returns ``(compound_image, grid)`` where compound_image is
     ``(frames, elev, z, x)`` complex64 and ``grid`` arrays are ``(z, elev, x)``.
+
+    ``stream_accumulate=True`` (mb-crr.2 / STREAM-BF) sums each transmit angle's
+    contribution into a single host accumulator instead of stacking all angles
+    first. Output is numerically identical (a sum over the same angles) but peak
+    host memory drops from ``~angles x`` the volume to ``~2x`` it -- the
+    difference between ~120 GB and ~24 GB at this dataset's per-acq size.
     """
     if not MACH_AVAILABLE:
         raise ImportError(
@@ -351,13 +359,11 @@ def beamform_iq(
         del dc
 
     iq_cp = cp.asarray(iq)
-    all_beamformed = []
-    for angle_idx in range(num_angles):
+
+    def _angle_bf(angle_idx):
         ch = iq_cp[:, angle_idx, :, :, :].reshape(num_frames, num_rows * num_cols, num_time)
         ch = cp.transpose(ch, (1, 2, 0))[cp.newaxis, ...]  # (1, n_rx, n_samples, n_frames)
-
         tx_arrivals = tx_arrivals_all[angle_idx][cp.newaxis, :]
-
         bf = _mach_beamform(
             channel_data=ch,
             rx_coords_m=rx_coords_cp,
@@ -370,12 +376,21 @@ def beamform_iq(
             modulation_freq_hz=config.tx_freq_hz,
             tukey_alpha=0.5,
         )  # (n_points, n_frames)
-        bf = bf.reshape(grid.depth_pixels, grid.height_pixels, grid.width_pixels, num_frames)
-        all_beamformed.append(cp.asnumpy(bf))
+        return bf.reshape(grid.depth_pixels, grid.height_pixels, grid.width_pixels, num_frames)
 
-    # (A, z, elev, x, F) -> compound over angles -> (F, elev, z, x)
-    beamformed_all = np.stack(all_beamformed, axis=0).astype(np.complex64)
-    compound = beamformed_all.sum(axis=0)  # (z, elev, x, F)
+    if stream_accumulate:
+        # Sum angles into one host accumulator: peak host ~2x the volume, not Ax.
+        acc = None
+        for angle_idx in range(num_angles):
+            contrib = cp.asnumpy(_angle_bf(angle_idx))
+            acc = contrib if acc is None else acc + contrib
+            del contrib
+        compound = acc  # (z, elev, x, F)
+    else:
+        all_beamformed = [cp.asnumpy(_angle_bf(a)) for a in range(num_angles)]
+        # (A, z, elev, x, F) -> compound over angles -> (z, elev, x, F)
+        compound = np.stack(all_beamformed, axis=0).astype(np.complex64).sum(axis=0)
+
     compound = np.transpose(compound, (3, 1, 0, 2)).astype(np.complex64)  # (F, elev, z, x)
     return compound, grid
 
