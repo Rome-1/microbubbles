@@ -702,7 +702,20 @@ def _filter_acquisition(compound: np.ndarray, opts: TrackingOptions) -> np.ndarr
     )
 
 
-def _run_selected(opts: TrackingOptions, selected: list[int], output_path: Path) -> Path:
+def _iter_compounds_h5(beamformed_path: Path, selected: list[int]):
+    """Default per-acq compound source: read each acquisition from the H5 file."""
+    with open_h5(beamformed_path) as h5:
+        for acq_id in selected:
+            gx, gy, gz = grid_arrays(h5, acq_id)
+            yield int(acq_id), load_compound(h5, acq_id), gx, gy, gz
+
+
+def _run_selected(
+    opts: TrackingOptions,
+    selected: list[int],
+    output_path: Path,
+    compound_iter=None,
+) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     detections_by_frame: list[np.ndarray] = []
     intensities_by_frame: list[np.ndarray] = []
@@ -715,42 +728,40 @@ def _run_selected(opts: TrackingOptions, selected: list[int], output_path: Path)
     grid_x = grid_y = grid_z = None
     frames_per_acq = 0
 
-    with open_h5(opts.beamformed_path) as h5:
-        for acq_order, acq_id in enumerate(selected):
-            compound = load_compound(h5, acq_id)
-            if frames_per_acq == 0:
-                frames_per_acq = int(compound.shape[0])
-            grid_x, grid_y, grid_z = grid_arrays(h5, acq_id)
-            filtered = _filter_acquisition(compound, opts)
-            batch = detect_batch(
-                filtered,
-                sigma_threshold=opts.sigma_threshold,
-                min_distance=opts.min_distance,
-                smoothing_sigma=opts.smoothing_sigma,
+    source = compound_iter if compound_iter is not None else _iter_compounds_h5(opts.beamformed_path, selected)
+    for acq_order, (acq_id, compound, grid_x, grid_y, grid_z) in enumerate(source):
+        if frames_per_acq == 0:
+            frames_per_acq = int(compound.shape[0])
+        filtered = _filter_acquisition(compound, opts)
+        batch = detect_batch(
+            filtered,
+            sigma_threshold=opts.sigma_threshold,
+            min_distance=opts.min_distance,
+            smoothing_sigma=opts.smoothing_sigma,
+        )
+        batch = _knee_filter_batch(batch, opts)
+        print(f"[track] acq={acq_id} frames={filtered.shape[0]} shape={filtered.shape[1:]}")
+        for frame_in_acq, (pixels, intensities, zscores) in enumerate(batch):
+            global_frame = acq_order * int(compound.shape[0]) + frame_in_acq
+            if len(pixels) == 0:
+                detections_by_frame.append(np.empty((0, 3), dtype=np.float32))
+                intensities_by_frame.append(np.empty(0, dtype=np.float32))
+                continue
+            subpix = subpixel_localize_3d(
+                filtered[frame_in_acq],
+                pixels,
+                method=opts.subpixel,
+                window_size=opts.window_size,
             )
-            batch = _knee_filter_batch(batch, opts)
-            print(f"[track] acq={acq_id} frames={filtered.shape[0]} shape={filtered.shape[1:]}")
-            for frame_in_acq, (pixels, intensities, zscores) in enumerate(batch):
-                global_frame = acq_order * int(compound.shape[0]) + frame_in_acq
-                if len(pixels) == 0:
-                    detections_by_frame.append(np.empty((0, 3), dtype=np.float32))
-                    intensities_by_frame.append(np.empty(0, dtype=np.float32))
-                    continue
-                subpix = subpixel_localize_3d(
-                    filtered[frame_in_acq],
-                    pixels,
-                    method=opts.subpixel,
-                    window_size=opts.window_size,
-                )
-                positions = indices_to_mm(subpix, grid_x, grid_y, grid_z)
-                detections_by_frame.append(positions)
-                intensities_by_frame.append(intensities)
-                all_indices.append(subpix)
-                all_positions.append(positions)
-                all_intensities.append(intensities)
-                all_zscores.append(zscores)
-                all_frames.append(np.full(len(positions), global_frame, dtype=np.int32))
-                all_acqs.append(np.full(len(positions), int(acq_id), dtype=np.int32))
+            positions = indices_to_mm(subpix, grid_x, grid_y, grid_z)
+            detections_by_frame.append(positions)
+            intensities_by_frame.append(intensities)
+            all_indices.append(subpix)
+            all_positions.append(positions)
+            all_intensities.append(intensities)
+            all_zscores.append(zscores)
+            all_frames.append(np.full(len(positions), global_frame, dtype=np.int32))
+            all_acqs.append(np.full(len(positions), int(acq_id), dtype=np.int32))
 
     if grid_x is None or grid_y is None or grid_z is None:
         raise RuntimeError("No acquisitions processed")
@@ -1155,8 +1166,7 @@ def export_tracks_bin(
     return output_path
 
 
-def run_tracking_outputs(opts: TrackingOptions) -> Path:
-    tracks = run_tracking(opts)
+def _smooth_and_export(opts: TrackingOptions, tracks: Path) -> Path:
     smoothed = smooth_tracks_pickle(
         tracks, None, sigma=opts.smooth_sigma, method=opts.smooth_method,
         interp_factor=opts.smooth_interp_factor, window=opts.smooth_window,
@@ -1170,6 +1180,20 @@ def run_tracking_outputs(opts: TrackingOptions) -> Path:
                 min_length=min_length,
             )
     return smoothed
+
+
+def run_tracking_outputs(opts: TrackingOptions) -> Path:
+    return _smooth_and_export(opts, run_tracking(opts))
+
+
+def run_tracking_outputs_streamed(opts: TrackingOptions, selected: list[int], compound_iter) -> Path:
+    """Fused path (mb-crr.2/.4): track from a per-acq compound provider instead of
+    a beamformed H5 file. ``compound_iter`` yields (acq_id, compound, gx, gy, gz);
+    ``selected`` is the acq id list it will yield, recorded in params. Produces the
+    same tracks/smoothing/bins as the H5 path -- used to fuse beamform->track so
+    the 11.9GB/acq volume is never persisted."""
+    tracks = _run_selected(opts, selected, opts.tracks_path, compound_iter=compound_iter)
+    return _smooth_and_export(opts, tracks)
 
 
 def _tuple_arg(value) -> tuple[float, float, float] | None:

@@ -505,16 +505,157 @@ def track(beamformed: str = "baseline.h5", frame_rate_hz: float = 222.0,
     return {"tracks_dir": str(out_dir), "smoothed": str(smoothed)}
 
 
+# --------------------------------------------------------------------------- #
+# baseline — GPU, FUSED beamform->SVD->detect->localize->track. Beamforms each
+# acq, feeds it straight to the streamed tracker, and DISCARDS the 11.9GB volume.
+# Persists only: tracks (tiny) + compressed shards for a few reference acqs (for
+# the 3D volume viewer + diffs). This is the storage-sane baseline producer.
+# --------------------------------------------------------------------------- #
+@app.function(image=gpu_image, gpu="A10G", timeout=12 * 3600, memory=131072,
+              volumes={"/root/data": vol})
+def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float = 222.0,
+             spatial_tgc: bool = True, tgc_acqs: int = 12, tgc_sigma_lambda: float = 9.0,
+             tgc_svd_cut: float = 0.05, acq_start: int = 0, num_acqs: int = 0,
+             acq_step: int = 1, keep_orders: str = "0,74,148,222",
+             min_track_length: int = 5, svd_method: str = "adaptive",
+             tag: str = "baseline") -> dict:
+    import json
+    import os
+    import sys
+    import time
+    from pathlib import Path
+
+    import h5py
+    import numpy as np
+
+    sys.path.insert(0, "/workspace")
+    from ultratrace_ulm.beamform_core import beamform_iq
+    from ultratrace_ulm.tracking import TrackingOptions, run_tracking_outputs_streamed
+
+    _ensure_root()
+    out_dir = Path(_guard(f"{DATA_ROOT}/tracks/{tag}"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ref_dir = _guard(f"{DATA_ROOT}/beamformed/{tag}_refs")
+    os.makedirs(ref_dir, exist_ok=True)
+    keep = {int(x) for x in keep_orders.split(",") if x.strip() != ""}
+
+    h5, fobj = _open_remote_h5(url)
+    all_ids = sorted(int(k) for k in h5["acquisitions"].keys() if str(k).isdigit())
+    sel = all_ids[acq_start::acq_step]
+    if num_acqs and num_acqs > 0:
+        sel = sel[:num_acqs]
+    config = _build_config(h5, elev_planes)
+
+    def _read_acq(aid):
+        g = h5[f"acquisitions/{aid}"]
+        return (
+            np.asarray(g["iq_frames"], dtype=np.complex64),
+            np.asarray(g["tx_delays"], dtype=np.float64),
+            np.asarray(g["tx_delays_elev"], dtype=np.float64),
+        )
+
+    # ---- TGC pass (incremental power map; see beamform_all). ----
+    inv_sqrt = None
+    if spatial_tgc:
+        from scipy.ndimage import gaussian_filter
+
+        from ultratrace_ulm.svd import filter_svd_3d
+
+        if tgc_acqs and tgc_acqs < len(sel):
+            idx = np.unique(np.linspace(0, len(sel) - 1, tgc_acqs).round().astype(int))
+            tgc_sel = [sel[i] for i in idx]
+        else:
+            tgc_sel = list(sel)
+        print(f"[tgc] {len(tgc_sel)} acq(s)", flush=True)
+        pd_sum, ref_grid = None, None
+        for aid in tgc_sel:
+            iq, txd, txde = _read_acq(aid)
+            comp, ref_grid = beamform_iq(iq, txd, txde, config, stream_accumulate=True)
+            out = filter_svd_3d(comp, low_cutoff=tgc_svd_cut, method="full")
+            pd = (np.abs(out) ** 2).mean(0)
+            pd_sum = pd if pd_sum is None else pd_sum + pd
+            del comp, out, pd
+        pd_mean = pd_sum / len(tgc_sel)
+        z_ax, y_ax, x_ax = ref_grid.z[:, 0, 0], ref_grid.y[0, :, 0], ref_grid.x[0, 0, :]
+        sigma_m = tgc_sigma_lambda * (1540.0 / config.tx_freq_hz)
+        dz = abs(z_ax[1] - z_ax[0]) if len(z_ax) > 1 else None
+        dx = abs(x_ax[1] - x_ax[0]) if len(x_ax) > 1 else None
+        dy = abs(y_ax[1] - y_ax[0]) if len(y_ax) > 1 else None
+        sig = (sigma_m / dy if (dy and dy > 0) else 0.0,
+               sigma_m / dz if dz else 0.0, sigma_m / dx if dx else 0.0)
+        tgc = gaussian_filter(pd_mean, sigma=sig).astype(np.float32)
+        inv_sqrt = (1.0 / np.sqrt(np.maximum(tgc, np.finfo(np.float32).eps)))[None]
+
+    times = []
+
+    def _provider():
+        for order, aid in enumerate(sel):
+            iq, txd, txde = _read_acq(aid)
+            t0 = time.time()
+            comp, grid = beamform_iq(iq, txd, txde, config, stream_accumulate=True)
+            if inv_sqrt is not None:
+                comp = (comp * inv_sqrt).astype(np.complex64)
+            times.append(time.time() - t0)
+            if order in keep:
+                shard = os.path.join(ref_dir, f"acq_{order:04d}.h5")
+                tmp = shard + ".tmp"
+                with h5py.File(tmp, "w") as o:
+                    meta = o.require_group(f"acquisitions/{order}/meta")
+                    meta.create_dataset("compound_image", data=comp,
+                                        chunks=(1,) + tuple(comp.shape[1:]), compression="lzf")
+                    gg = meta.require_group("grid")
+                    for axis, arr in (("x", grid.x), ("y", grid.y), ("z", grid.z)):
+                        gg.create_dataset(axis, data=arr.astype(np.float64), compression="lzf")
+                    o.attrs["src_acq_id"] = int(aid)
+                os.replace(tmp, shard)
+                vol.commit()
+            # Grid (z,elev,x) meters -> (elev,z,x) mm, matching h5_io.grid_arrays.
+            gx = (np.transpose(grid.x, (1, 0, 2)) * 1000.0).astype(np.float32)
+            gy = (np.transpose(grid.y, (1, 0, 2)) * 1000.0).astype(np.float32)
+            gz = (np.transpose(grid.z, (1, 0, 2)) * 1000.0).astype(np.float32)
+            print(f"[fused] order={order} acq={aid} {tuple(comp.shape)} "
+                  f"{times[-1]:.1f}s", flush=True)
+            yield int(aid), comp, gx, gy, gz
+
+    opts = TrackingOptions(
+        beamformed_path=Path(f"{DATA_ROOT}/none"), tracks_path=out_dir / "tracks.pkl",
+        svd_method=svd_method, knee_filter=True, tissue_freq_hz=100.0, temporal_sigma=0.0,
+        filter_method="svd", svd_low_cutoff=0.1, sigma_threshold=2.0, min_distance=2,
+        smoothing_sigma=1.0, subpixel="centroid", window_size=5, tracking="kalman",
+        frame_rate_hz=frame_rate_hz, max_gap=3, min_track_length=min_track_length,
+        reversal_penalty=10.0, max_cost=10.0, smooth_sigma=2.0, smooth_method="gaussian",
+        export_dir=out_dir, export_stem="tracks", export_min_lengths=(5, 20, 50),
+    )
+    try:
+        smoothed = run_tracking_outputs_streamed(opts, [int(a) for a in sel], _provider())
+    finally:
+        h5.close()
+        fobj.close()
+    vol.commit()
+    report = {
+        "tag": tag, "n_acqs": len(sel), "tracks_dir": str(out_dir),
+        "ref_shards": sorted(os.listdir(ref_dir)),
+        "median_beamform_s": round(float(np.median(times)), 2) if times else None,
+        "smoothed": str(smoothed),
+    }
+    with open(_guard(f"{DATA_ROOT}/tracks/{tag}/baseline_report.json"), "w") as fh:
+        json.dump(report, fh, indent=2)
+    vol.commit()
+    print(json.dumps(report, indent=2))
+    return report
+
+
 @app.local_entrypoint()
 def main(fn: str = "inspect"):
     """Convenience: `modal run scripts/modal/app.py` runs inspect by default.
 
     Prefer explicit `modal run scripts/modal/app.py::<fn>` for inspect / probe /
-    download / beamform_all / consolidate / track.
+    download / beamform_all / consolidate / track / baseline.
     """
     table = {
         "inspect": inspect, "probe": probe, "download": download,
         "beamform_all": beamform_all, "consolidate": consolidate, "track": track,
+        "baseline": baseline,
     }
     if fn not in table:
         raise SystemExit(f"unknown fn {fn!r}; choose from {sorted(table)}")
