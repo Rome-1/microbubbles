@@ -78,12 +78,15 @@ def filter_svd_3d_gpu(
     G = cp.zeros((n_frames, n_frames), dtype=cp.complex128)
     Gc = cp.zeros((n_frames, n_frames), dtype=cp.complex128) if method == "adaptive" else None
     for s0 in range(0, n_vox, voxel_chunk):
-        mc = mat[:, s0:s0 + voxel_chunk].astype(cp.complex128)
-        G += mc @ mc.conj().T
+        mc = mat[:, s0:s0 + voxel_chunk]  # complex64 view (no 2x copy)
+        # per-chunk Gram in complex64; accumulate the small (F,F) result in
+        # complex128 so the cross-chunk sum doesn't drift (the precision that
+        # actually matters), without 3.4GB complex128 chunk temporaries.
+        G += (mc @ mc.conj().T).astype(cp.complex128)
         if Gc is not None:
             xc = mc - mc.mean(axis=0, keepdims=True)
-            Gc += xc @ xc.conj().T
-        del mc
+            Gc += (xc @ xc.conj().T).astype(cp.complex128)
+            del xc
 
     if method == "adaptive":
         if frame_rate_hz is None:
