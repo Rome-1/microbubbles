@@ -1083,12 +1083,15 @@ def export_tracks_bin(
     output_path: Path,
     min_length: int,
     use_smoothed: bool = True,
-) -> Path:
+) -> Path | None:
     data = load_pickle(pickle_path)
     key = "tracks_smoothed" if use_smoothed and "tracks_smoothed" in data else "tracks"
     tracks = [t for t in data.get(key, []) if int(t.get("length", len(t["positions"]))) >= min_length]
     if not tracks:
-        raise SystemExit(f"No tracks with length >= {min_length} in {pickle_path}")
+        # Skip rather than abort: a short run can legitimately have no long tracks,
+        # and one empty min-length bin shouldn't sink the whole export.
+        print(f"[export] skip {output_path.name}: no tracks with length >= {min_length}")
+        return None
 
     frame_rate_hz = float(data.get("params", {}).get("frame_rate_hz") or 1.0)
     n_acqs = int(data.get("n_acquisitions") or data.get("n_acqs") or 0)

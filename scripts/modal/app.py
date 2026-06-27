@@ -664,6 +664,66 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
     return report
 
 
+@app.function(image=gpu_image, gpu="A10G", timeout=1800, memory=98304,
+              volumes={"/root/data": vol})
+def validate_svd(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float = 222.0) -> dict:
+    """Equivalence probe: CPU vs GPU SVD on one acq (cutoff, array diff, detections)."""
+    import json
+    import sys
+
+    import numpy as np
+
+    sys.path.insert(0, "/workspace")
+    import cupy as cp
+
+    from ultratrace_ulm.beamform_core import beamform_iq
+    from ultratrace_ulm.gpu_svd import _spectral_centroid_cutoff_gpu, filtered_magnitude_gpu
+    from ultratrace_ulm.svd import filtered_magnitude, spectral_centroid_cutoff
+    from ultratrace_ulm.tracking import detect_batch
+
+    h5, fobj = _open_remote_h5(url)
+    ids = sorted(int(k) for k in h5["acquisitions"].keys() if str(k).isdigit())
+    config = _build_config(h5, elev_planes)
+    g = h5[f"acquisitions/{ids[0]}"]
+    comp, _ = beamform_iq(
+        np.asarray(g["iq_frames"], dtype=np.complex64),
+        np.asarray(g["tx_delays"], dtype=np.float64),
+        np.asarray(g["tx_delays_elev"], dtype=np.float64),
+        config, stream_accumulate=True,
+    )
+    h5.close()
+    fobj.close()
+
+    F = comp.shape[0]
+    cpu_low = int(spectral_centroid_cutoff(comp.reshape(F, -1).astype(np.complex64),
+                                           frame_rate_hz, 100.0))
+    mat = cp.asarray(comp, dtype=cp.complex64).reshape(F, -1)
+    Gc = cp.zeros((F, F), dtype=cp.complex64)
+    for s0 in range(0, mat.shape[1], 300_000):
+        mc = mat[:, s0:s0 + 300_000]
+        xc = mc - mc.mean(axis=0, keepdims=True)
+        Gc += xc @ xc.conj().T
+    gpu_low = int(_spectral_centroid_cutoff_gpu(Gc, F, frame_rate_hz, 100.0))
+    del mat, Gc
+    cp.get_default_memory_pool().free_all_blocks()
+
+    cpu_mag = filtered_magnitude(comp, method="adaptive", frame_rate_hz=frame_rate_hz, tissue_freq_hz=100.0)
+    gpu_mag = filtered_magnitude_gpu(comp, method="adaptive", frame_rate_hz=frame_rate_hz, tissue_freq_hz=100.0)
+    diff = np.abs(cpu_mag - gpu_mag)
+    denom = float(np.abs(cpu_mag).mean()) or 1.0
+    cpu_det = int(sum(len(p) for p, _, _ in detect_batch(cpu_mag, 2.0, 2, 1.0)))
+    gpu_det = int(sum(len(p) for p, _, _ in detect_batch(gpu_mag, 2.0, 2, 1.0)))
+    report = {
+        "cpu_low": cpu_low, "gpu_low": gpu_low,
+        "max_abs_diff": float(diff.max()), "mean_abs_diff": float(diff.mean()),
+        "rel_mean_diff": float(diff.mean() / denom),
+        "cpu_mag_mean": float(cpu_mag.mean()), "gpu_mag_mean": float(gpu_mag.mean()),
+        "cpu_detections": cpu_det, "gpu_detections": gpu_det,
+    }
+    print(json.dumps(report, indent=2))
+    return report
+
+
 @app.local_entrypoint()
 def main(fn: str = "inspect"):
     """Convenience: `modal run scripts/modal/app.py` runs inspect by default.
@@ -674,7 +734,7 @@ def main(fn: str = "inspect"):
     table = {
         "inspect": inspect, "probe": probe, "download": download,
         "beamform_all": beamform_all, "consolidate": consolidate, "track": track,
-        "baseline": baseline,
+        "baseline": baseline, "validate_svd": validate_svd,
     }
     if fn not in table:
         raise SystemExit(f"unknown fn {fn!r}; choose from {sorted(table)}")
