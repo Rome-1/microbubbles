@@ -518,7 +518,7 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
              tgc_svd_cut: float = 0.05, acq_start: int = 0, num_acqs: int = 0,
              acq_step: int = 1, keep_orders: str = "0,74,148,222",
              min_track_length: int = 5, svd_method: str = "adaptive",
-             tag: str = "baseline") -> dict:
+             use_gpu_svd: bool = True, tag: str = "baseline") -> dict:
     import json
     import os
     import sys
@@ -559,7 +559,10 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
     if spatial_tgc:
         from scipy.ndimage import gaussian_filter
 
-        from ultratrace_ulm.svd import filter_svd_3d
+        if use_gpu_svd:
+            from ultratrace_ulm.gpu_svd import filter_svd_3d_gpu as _tgc_svd
+        else:
+            from ultratrace_ulm.svd import filter_svd_3d as _tgc_svd
 
         if tgc_acqs and tgc_acqs < len(sel):
             idx = np.unique(np.linspace(0, len(sel) - 1, tgc_acqs).round().astype(int))
@@ -571,7 +574,9 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
         for aid in tgc_sel:
             iq, txd, txde = _read_acq(aid)
             comp, ref_grid = beamform_iq(iq, txd, txde, config, stream_accumulate=True)
-            out = filter_svd_3d(comp, low_cutoff=tgc_svd_cut, method="full")
+            # GPU path uses the fast cov-projection for the TGC power map (the
+            # full-SVD power map is ~identical for a smooth normalisation map).
+            out = _tgc_svd(comp, low_cutoff=tgc_svd_cut, method="fast" if use_gpu_svd else "full")
             pd = (np.abs(out) ** 2).mean(0)
             pd_sum = pd if pd_sum is None else pd_sum + pd
             del comp, out, pd
@@ -626,8 +631,22 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
         reversal_penalty=10.0, max_cost=10.0, smooth_sigma=2.0, smooth_method="gaussian",
         export_dir=out_dir, export_stem="tracks", export_min_lengths=(5, 20, 50),
     )
+    gpu_filter = None
+    if use_gpu_svd:
+        from ultratrace_ulm.gpu_svd import filtered_magnitude_gpu
+
+        def gpu_filter(compound, o):
+            return filtered_magnitude_gpu(
+                compound, low_cutoff=o.svd_low_cutoff, high_cutoff=o.svd_high_cutoff,
+                method=o.svd_method, temporal_sigma=o.temporal_sigma,
+                n_components=o.svd_n_components, frame_rate_hz=o.frame_rate_hz,
+                tissue_freq_hz=o.tissue_freq_hz,
+            )
+
     try:
-        smoothed = run_tracking_outputs_streamed(opts, [int(a) for a in sel], _provider())
+        smoothed = run_tracking_outputs_streamed(
+            opts, [int(a) for a in sel], _provider(), filter_fn=gpu_filter,
+        )
     finally:
         h5.close()
         fobj.close()

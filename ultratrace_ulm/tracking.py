@@ -715,6 +715,7 @@ def _run_selected(
     selected: list[int],
     output_path: Path,
     compound_iter=None,
+    filter_fn=None,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     detections_by_frame: list[np.ndarray] = []
@@ -732,7 +733,7 @@ def _run_selected(
     for acq_order, (acq_id, compound, grid_x, grid_y, grid_z) in enumerate(source):
         if frames_per_acq == 0:
             frames_per_acq = int(compound.shape[0])
-        filtered = _filter_acquisition(compound, opts)
+        filtered = (filter_fn or _filter_acquisition)(compound, opts)
         batch = detect_batch(
             filtered,
             sigma_threshold=opts.sigma_threshold,
@@ -1186,13 +1187,18 @@ def run_tracking_outputs(opts: TrackingOptions) -> Path:
     return _smooth_and_export(opts, run_tracking(opts))
 
 
-def run_tracking_outputs_streamed(opts: TrackingOptions, selected: list[int], compound_iter) -> Path:
+def run_tracking_outputs_streamed(
+    opts: TrackingOptions, selected: list[int], compound_iter, filter_fn=None,
+) -> Path:
     """Fused path (mb-crr.2/.4): track from a per-acq compound provider instead of
     a beamformed H5 file. ``compound_iter`` yields (acq_id, compound, gx, gy, gz);
-    ``selected`` is the acq id list it will yield, recorded in params. Produces the
-    same tracks/smoothing/bins as the H5 path -- used to fuse beamform->track so
-    the 11.9GB/acq volume is never persisted."""
-    tracks = _run_selected(opts, selected, opts.tracks_path, compound_iter=compound_iter)
+    ``selected`` is the acq id list it will yield, recorded in params. ``filter_fn``
+    overrides the per-acq clutter filter (e.g. the GPU SVD) -- defaults to the CPU
+    ``_filter_acquisition``. Produces the same tracks/smoothing/bins as the H5 path;
+    used to fuse beamform->track so the 11.9GB/acq volume is never persisted."""
+    tracks = _run_selected(
+        opts, selected, opts.tracks_path, compound_iter=compound_iter, filter_fn=filter_fn,
+    )
     return _smooth_and_export(opts, tracks)
 
 
