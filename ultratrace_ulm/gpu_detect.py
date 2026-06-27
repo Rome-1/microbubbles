@@ -23,6 +23,7 @@ def detect_batch_gpu(
     sigma_threshold: float,
     min_distance: int,
     smoothing_sigma: float,
+    frame_chunk: int = 150,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     import cupy as cp
     from cupyx.scipy.ndimage import gaussian_filter, maximum_filter
@@ -32,18 +33,23 @@ def detect_batch_gpu(
     n_frames, n_elev = int(magnitude.shape[0]), int(magnitude.shape[1])
     empty = (np.empty((0, 3), dtype=np.int32), np.empty(0, dtype=np.float32),
              np.empty(0, dtype=np.float32))
+    pool = cp.get_default_memory_pool()
+    pool.free_all_blocks()
 
-    cp.get_default_memory_pool().free_all_blocks()
-    vol = cp.asarray(magnitude, dtype=cp.float32)
-    smoothed = gaussian_filter(vol, sigma=(0, 0, smoothing_sigma, smoothing_sigma)) if smoothing_sigma > 0 else vol
-    del vol
+    # One smoothed volume on the GPU (~6GB). Smooth in place (spatial only).
+    sm = cp.asarray(magnitude, dtype=cp.float32)
+    if smoothing_sigma > 0:
+        tmp = gaussian_filter(sm, sigma=(0, 0, smoothing_sigma, smoothing_sigma))
+        del sm
+        sm = tmp
+        del tmp
+        pool.free_all_blocks()
 
-    # Per-elevation-slice mean/std over positive (smoothed) voxels -- mirrors
-    # _slice_stats (which smooths with the same kernel, so we reuse `smoothed`).
+    # Per-elevation-slice mean/std over positive smoothed voxels (mirrors _slice_stats).
     means = cp.zeros(n_elev, dtype=cp.float32)
     stds = cp.ones(n_elev, dtype=cp.float32)
     for e in range(n_elev):
-        v = smoothed[:, e]
+        v = sm[:, e]
         mask = v > 0
         if bool(mask.any()):
             vals = v[mask]
@@ -51,27 +57,36 @@ def detect_batch_gpu(
             s = vals.std()
             stds[e] = s if float(s) > 1e-10 else 1.0
 
-    zscore = (smoothed - means[None, :, None, None]) / (stds[None, :, None, None] + 1e-10)
-    del smoothed
-
+    # z-score in place (no second full volume), then peak-find in frame chunks
+    # (frames are independent: the max-filter is size 1 along the frame axis).
+    sm -= means[None, :, None, None]
+    sm /= (stds[None, :, None, None] + 1e-10)
     fs = 2 * int(min_distance) + 1
-    maxf = maximum_filter(zscore, size=(1, fs, fs, fs))
-    is_peak = (zscore == maxf) & (zscore > float(sigma_threshold))
-    del maxf
+    thr = float(sigma_threshold)
 
-    coords = cp.where(is_peak)            # tuple of 4 index arrays, frame-sorted
-    zs_pk = cp.asnumpy(zscore[is_peak]).astype(np.float32, copy=False)
-    coords = [cp.asnumpy(c) for c in coords]
-    del zscore, is_peak
-    cp.get_default_memory_pool().free_all_blocks()
+    cf, ce, cz, cx, czs = [], [], [], [], []
+    for f0 in range(0, n_frames, frame_chunk):
+        f1 = min(f0 + frame_chunk, n_frames)
+        zc = sm[f0:f1]
+        mx = maximum_filter(zc, size=(1, fs, fs, fs))
+        pk = (zc == mx) & (zc > thr)
+        idx = cp.where(pk)
+        if idx[0].size:
+            cf.append(cp.asnumpy(idx[0]) + f0)
+            ce.append(cp.asnumpy(idx[1])); cz.append(cp.asnumpy(idx[2])); cx.append(cp.asnumpy(idx[3]))
+            czs.append(cp.asnumpy(zc[pk]).astype(np.float32, copy=False))
+        del zc, mx, pk, idx
+        pool.free_all_blocks()
+    del sm
+    pool.free_all_blocks()
 
-    if coords[0].size == 0:
+    if not cf:
         return [empty for _ in range(n_frames)]
-
-    frame_ids = coords[0]
-    spatial = np.stack(coords[1:], axis=1).astype(np.int32, copy=False)  # (N,3)
-    # intensities from the ORIGINAL (host) magnitude, matching detect_batch.
-    intensities = magnitude[coords[0], coords[1], coords[2], coords[3]].astype(np.float32, copy=False)
+    frame_ids = np.concatenate(cf)                              # ascending (chunks in order)
+    ei, zi, xi = np.concatenate(ce), np.concatenate(cz), np.concatenate(cx)
+    zs_pk = np.concatenate(czs)
+    spatial = np.stack([ei, zi, xi], axis=1).astype(np.int32, copy=False)
+    intensities = magnitude[frame_ids, ei, zi, xi].astype(np.float32, copy=False)
     bounds = np.searchsorted(frame_ids, np.arange(n_frames + 1))
     out = []
     for frame in range(n_frames):
