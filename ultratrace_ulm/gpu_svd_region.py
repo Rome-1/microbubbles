@@ -24,6 +24,49 @@ from __future__ import annotations
 import numpy as np
 
 
+def _global_rank_gpu(
+    data: np.ndarray,
+    method: str,
+    low_cutoff: float,
+    n_components: int | None,
+    frame_rate_hz: float | None,
+    tissue_freq_hz: float,
+    voxel_chunk: int,
+) -> int:
+    """GPU equivalent of ``svd_region._resolve_rank`` on the WHOLE volume: the
+    single global rank k for ``cutoff_mode="global_rank"``.
+
+    For ``method="adaptive"`` it accumulates the mean-subtracted Gram over voxel
+    chunks (transferring each chunk host->device, in complex128 like
+    ``gpu_svd.filter_svd_3d_gpu``) and feeds it to the canonical phase-invariant
+    cutoff -- so the full (700, ~2.13M) matrix is never resident on the card."""
+    import cupy as cp
+
+    from .gpu_svd import _spectral_centroid_cutoff_gpu
+    from .svd import _component_count
+
+    n_frames = int(data.shape[0])
+    if method == "adaptive":
+        if frame_rate_hz is None:
+            raise ValueError("method='adaptive' requires frame_rate_hz")
+        mat = data.reshape(n_frames, -1)  # host view
+        n_vox = mat.shape[1]
+        cp.get_default_memory_pool().free_all_blocks()
+        gram_c = cp.zeros((n_frames, n_frames), dtype=cp.complex128)
+        for s0 in range(0, n_vox, voxel_chunk):
+            chunk = cp.asarray(mat[:, s0:s0 + voxel_chunk], dtype=cp.complex64)
+            xc = chunk - chunk.mean(axis=0, keepdims=True)
+            gram_c += (xc @ xc.conj().T).astype(cp.complex128)
+            del chunk, xc
+        k = _spectral_centroid_cutoff_gpu(gram_c, n_frames, frame_rate_hz, tissue_freq_hz)
+        del gram_c
+        cp.get_default_memory_pool().free_all_blocks()
+        return k
+    if method == "none":
+        return 0
+    return int(n_components) if n_components is not None else _component_count(low_cutoff, n_frames)
+
+
 def filter_svd_3d_region_gpu(
     data: np.ndarray,
     n_z_blocks: int = 3,
@@ -35,12 +78,19 @@ def filter_svd_3d_region_gpu(
     tissue_freq_hz: float = 100.0,
     high_cutoff: float | None = None,
     n_components: int | None = None,
+    cutoff_mode: str = "global_rank",
     voxel_chunk: int = 300_000,
 ) -> np.ndarray:
     """GPU region-adaptive temporal-SVD clutter filter. Returns the blended
     filtered complex volume on the host, same shape as ``data``
     ((F,elev,z,x) or (F,z,x)). Reduces to ``gpu_svd.filter_svd_3d_gpu`` when
-    ``n_z_blocks == n_x_blocks == 1``."""
+    ``n_z_blocks == n_x_blocks == 1``.
+
+    ``cutoff_mode`` mirrors ``svd_region.filter_svd_3d_region``:
+    ``"global_rank"`` (default) computes one rank on the whole volume and applies
+    it as a fixed component count to every block (uniform removal -> no per-block
+    intensity inhomogeneity), while each block still uses its own local subspace;
+    ``"per_block"`` lets each block pick its own adaptive cutoff."""
     import cupy as cp
 
     from .gpu_svd import filter_svd_3d_gpu
@@ -60,6 +110,21 @@ def filter_svd_3d_region_gpu(
     z_windows = _axis_window(z_bounds, n_z)
     x_windows = _axis_window(x_bounds, n_x)
 
+    # Resolve the per-block filtering (one global rank applied as a fixed count,
+    # or each block's own adaptive cutoff). See svd_region.filter_svd_3d_region.
+    if cutoff_mode == "global_rank":
+        if method == "none":
+            block_method, block_ncomp = "none", None
+        else:
+            global_k = _global_rank_gpu(
+                data, method, low_cutoff, n_components, frame_rate_hz, tissue_freq_hz, voxel_chunk
+            )
+            block_method, block_ncomp = "fast", global_k
+    elif cutoff_mode == "per_block":
+        block_method, block_ncomp = method, n_components
+    else:
+        raise ValueError(f"Unknown cutoff_mode: {cutoff_mode!r}")
+
     # Blend accumulator stays on the HOST: each block is filtered on the GPU and
     # returned to host by filter_svd_3d_gpu, so device peak == one block's cost.
     acc = np.zeros(data.shape, dtype=np.complex64)
@@ -75,8 +140,8 @@ def filter_svd_3d_region_gpu(
                 block,
                 low_cutoff=low_cutoff,
                 high_cutoff=high_cutoff,
-                method=method,
-                n_components=n_components,
+                method=block_method,
+                n_components=block_ncomp,
                 frame_rate_hz=frame_rate_hz,
                 tissue_freq_hz=tissue_freq_hz,
                 voxel_chunk=voxel_chunk,
@@ -105,6 +170,7 @@ def filtered_magnitude_region_gpu(
     n_z_blocks: int = 3,
     n_x_blocks: int = 3,
     overlap: float = 0.25,
+    cutoff_mode: str = "global_rank",
     voxel_chunk: int = 300_000,
 ) -> np.ndarray:
     """GPU analogue of ``svd_region.filtered_magnitude_region``: returns float32
@@ -122,6 +188,7 @@ def filtered_magnitude_region_gpu(
         tissue_freq_hz=tissue_freq_hz,
         high_cutoff=high_cutoff,
         n_components=n_components,
+        cutoff_mode=cutoff_mode,
         voxel_chunk=voxel_chunk,
     )
     magnitude = np.abs(filtered).astype(np.float32, copy=False)

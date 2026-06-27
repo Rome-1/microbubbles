@@ -35,7 +35,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
-from .svd import filter_svd_3d
+from .svd import _component_count, filter_svd_3d, spectral_centroid_cutoff
 
 
 def _block_bounds(length: int, n_blocks: int, overlap: float) -> list[tuple[int, int]]:
@@ -88,6 +88,73 @@ def _axis_window(bounds: list[tuple[int, int]], length: int) -> list[np.ndarray]
     return windows
 
 
+def _resolve_rank(
+    matrix: np.ndarray,
+    method: str,
+    low_cutoff: float,
+    n_components: int | None,
+    frame_rate_hz: float | None,
+    tissue_freq_hz: float,
+) -> int:
+    """The integer rank k (number of leading temporal components removed) that
+    ``svd.filter_svd_3d`` would apply to ``matrix`` ((frames, voxels)) under the
+    given ``method`` -- used both for the single global rank and the per-block
+    diagnostic so they cannot drift from the filter's own behaviour."""
+    n_frames = int(matrix.shape[0])
+    if method == "adaptive":
+        if frame_rate_hz is None:
+            raise ValueError("method='adaptive' requires frame_rate_hz")
+        return spectral_centroid_cutoff(matrix, frame_rate_hz, tissue_freq_hz)
+    if method == "none":
+        return 0
+    return int(n_components) if n_components is not None else _component_count(low_cutoff, n_frames)
+
+
+def region_block_cutoffs(
+    data: np.ndarray,
+    n_z_blocks: int = 3,
+    n_x_blocks: int = 3,
+    overlap: float = 0.25,
+    cutoff_mode: str = "global_rank",
+    low_cutoff: float = 0.1,
+    method: str = "adaptive",
+    frame_rate_hz: float | None = None,
+    tissue_freq_hz: float = 100.0,
+    n_components: int | None = None,
+) -> np.ndarray:
+    """Diagnostic: the integer rank k that ``filter_svd_3d_region`` removes in
+    each (z, x) block, as an ``(n_z_blocks, n_x_blocks)`` int array.
+
+    Under ``cutoff_mode="global_rank"`` this is a single global rank broadcast to
+    every block (constant). Under ``cutoff_mode="per_block"`` with
+    ``method="adaptive"`` each block picks its own spectral-centroid cutoff, so
+    the count varies by region (the source of the per-block intensity
+    inhomogeneity that ``global_rank`` removes).
+    """
+    if data.ndim == 3:
+        data = data[:, None, :, :]
+    elif data.ndim != 4:
+        raise ValueError(f"Expected 3D or 4D compound data, got shape {data.shape}")
+
+    n_frames, _, n_z, n_x = data.shape
+    z_bounds = _block_bounds(n_z, n_z_blocks, overlap)
+    x_bounds = _block_bounds(n_x, n_x_blocks, overlap)
+    ks = np.zeros((len(z_bounds), len(x_bounds)), dtype=int)
+
+    if cutoff_mode == "global_rank":
+        matrix = np.asarray(data, dtype=np.complex64).reshape(n_frames, -1)
+        ks[:] = _resolve_rank(matrix, method, low_cutoff, n_components, frame_rate_hz, tissue_freq_hz)
+        return ks
+    if cutoff_mode != "per_block":
+        raise ValueError(f"Unknown cutoff_mode: {cutoff_mode!r}")
+
+    for iz, (za, zb) in enumerate(z_bounds):
+        for ix, (xa, xb) in enumerate(x_bounds):
+            bm = np.asarray(data[:, :, za:zb, xa:xb], dtype=np.complex64).reshape(n_frames, -1)
+            ks[iz, ix] = _resolve_rank(bm, method, low_cutoff, n_components, frame_rate_hz, tissue_freq_hz)
+    return ks
+
+
 def filter_svd_3d_region(
     data: np.ndarray,
     n_z_blocks: int = 3,
@@ -99,16 +166,31 @@ def filter_svd_3d_region(
     tissue_freq_hz: float = 100.0,
     high_cutoff: float | None = None,
     n_components: int | None = None,
+    cutoff_mode: str = "global_rank",
 ) -> np.ndarray:
     """Region-adaptive temporal-SVD clutter filter.
 
     Partitions the z and x axes into overlapping blocks (elev kept whole),
-    filters each sub-volume with ``svd.filter_svd_3d`` (its OWN per-block
-    adaptive cutoff), and blends overlaps with a smooth partition-of-unity
-    window. Returns the filtered COMPLEX volume, same shape as ``data``
-    ((F,elev,z,x) or (F,z,x)).
+    filters each sub-volume with ``svd.filter_svd_3d``, and blends overlaps with
+    a smooth partition-of-unity window. Returns the filtered COMPLEX volume,
+    same shape as ``data`` ((F,elev,z,x) or (F,z,x)).
 
-    Reduces EXACTLY to ``svd.filter_svd_3d`` when ``n_z_blocks == n_x_blocks == 1``.
+    ``cutoff_mode`` controls how the removal rank is chosen per block:
+
+    * ``"global_rank"`` (DEFAULT): compute ONE rank ``k`` on the whole volume
+      (the global adaptive spectral-centroid cutoff for ``method="adaptive"``,
+      else the fixed ``low_cutoff``/``n_components`` count), then filter every
+      block with that same ``k`` via ``n_components=k``. Each block still uses
+      its OWN local temporal subspace (from its local covariance), but removes
+      the same NUMBER of components everywhere. This keeps the region-adaptivity
+      benefit (local tissue subspace per block) while eliminating the per-block
+      intensity inhomogeneity that a varying per-block count introduces (bright
+      center / dim periphery banding).
+    * ``"per_block"``: each block computes its own cutoff (the original
+      behaviour). With ``method="adaptive"`` the removal count varies by region.
+
+    Reduces EXACTLY to ``svd.filter_svd_3d`` when ``n_z_blocks == n_x_blocks == 1``
+    (both cutoff modes).
     """
     if data.ndim == 3:
         data = data[:, None, :, :]
@@ -124,6 +206,25 @@ def filter_svd_3d_region(
     z_windows = _axis_window(z_bounds, n_z)
     x_windows = _axis_window(x_bounds, n_x)
 
+    # Resolve how each block is filtered. For "global_rank" we pick one rank from
+    # the whole volume and apply it as a fixed component COUNT to every block
+    # (uniform removal -> no per-block intensity inhomogeneity); each block still
+    # gets its own LOCAL subspace because filter_svd_3d works on the local block.
+    if cutoff_mode == "global_rank":
+        if method == "none":
+            block_method, block_ncomp = "none", None
+        else:
+            matrix = np.asarray(data, dtype=np.complex64).reshape(n_frames, -1)
+            global_k = _resolve_rank(
+                matrix, method, low_cutoff, n_components, frame_rate_hz, tissue_freq_hz
+            )
+            del matrix
+            block_method, block_ncomp = "fast", global_k
+    elif cutoff_mode == "per_block":
+        block_method, block_ncomp = method, n_components
+    else:
+        raise ValueError(f"Unknown cutoff_mode: {cutoff_mode!r}")
+
     acc = np.zeros(data.shape, dtype=np.complex64)
     wsum = np.zeros((n_z, n_x), dtype=np.float64)
 
@@ -134,8 +235,8 @@ def filter_svd_3d_region(
                 block,
                 low_cutoff=low_cutoff,
                 high_cutoff=high_cutoff,
-                method=method,
-                n_components=n_components,
+                method=block_method,
+                n_components=block_ncomp,
                 frame_rate_hz=frame_rate_hz,
                 tissue_freq_hz=tissue_freq_hz,
             )
@@ -162,6 +263,7 @@ def filtered_magnitude_region(
     n_z_blocks: int = 3,
     n_x_blocks: int = 3,
     overlap: float = 0.25,
+    cutoff_mode: str = "global_rank",
 ) -> np.ndarray:
     """Region-adaptive analogue of ``svd.filtered_magnitude``: returns float32
     |filtered|, optionally temporally smoothed."""
@@ -176,6 +278,7 @@ def filtered_magnitude_region(
         tissue_freq_hz=tissue_freq_hz,
         high_cutoff=high_cutoff,
         n_components=n_components,
+        cutoff_mode=cutoff_mode,
     )
     magnitude = np.abs(filtered).astype(np.float32, copy=False)
     if temporal_sigma > 0:
