@@ -47,6 +47,7 @@ class TrackingOptions:
     min_track_length: int = 15
     reversal_penalty: float = 10.0
     max_cost: float = 10.0
+    gate_on_prediction: bool = False  # mb-crr.10: gate on Kalman-predicted pos, not last-observed
     smooth_sigma: float = 2.0
     smooth_method: str = "gaussian"
     smooth_window: int = 5
@@ -229,6 +230,7 @@ def kalman_tracking_3d(
     reversal_penalty: float = 10.0,
     max_cost: float = 1e5,
     intensities: List[np.ndarray] = None,
+    gate_on_prediction: bool = False,
 ) -> List[Dict]:
     """
     Track bubbles in 3D using Kalman filter + Hungarian assignment.
@@ -364,7 +366,14 @@ def kalman_tracking_3d(
 
         # ---- Vectorized distance gating ----
         gaps = frame_idx - _frame_last  # (T,)
-        diffs = np.abs(_pos_last[:, None, :] - cur_dets[None, :, :])  # (T, D, 3)
+        if gate_on_prediction:
+            # mb-crr.10: gate on the Kalman-predicted position (x + dt*v), so a
+            # fast-but-valid bubble isn't rejected for being far from where the
+            # track was LAST seen. Baseline gates on _pos_last (last observed).
+            gate_pos = _states[:, :3] + gaps[:, None].astype(float) * _states[:, 3:]
+        else:
+            gate_pos = _pos_last
+        diffs = np.abs(gate_pos[:, None, :] - cur_dets[None, :, :])  # (T, D, 3)
         valid_mask = np.all(diffs <= max_dist_mm, axis=2) & (gaps[:, None] <= max_gap)
         valid_indices = np.argwhere(valid_mask)
 
@@ -530,6 +539,7 @@ def _track_detections(
             reversal_penalty=opts.reversal_penalty,
             max_cost=opts.max_cost,
             intensities=intensities,
+            gate_on_prediction=opts.gate_on_prediction,
         )
     active: list[dict] = []
     done: list[dict] = []
