@@ -680,6 +680,8 @@ def volume3d(refs_dir: str = "baseline_refs", svd_method: str = "adaptive",
     import numpy as np
 
     sys.path.insert(0, "/workspace")
+    import cupy as cp
+
     from ultratrace_ulm.gpu_svd import filter_svd_3d_gpu
 
     vol.reload()
@@ -705,7 +707,9 @@ def volume3d(refs_dir: str = "baseline_refs", svd_method: str = "adaptive",
                  x=(gx[0, 0, :] * 1000).astype(np.float32))
         arts.append(f"{base}_power.npy")
         vol.commit()
-        print(f"[volume3d] {base}: power {power.shape} max={float(power.max()):.3g}", flush=True)
+        del filt, power
+        cp.get_default_memory_pool().free_all_blocks()
+        print(f"[volume3d] {base}: power saved", flush=True)
     print(f"DONE volume3d: {len(arts)} volumes -> viz/{tag}")
     return {"out": f"{DATA_ROOT}/viz/{tag}", "svd_method": svd_method, "artifacts": arts}
 

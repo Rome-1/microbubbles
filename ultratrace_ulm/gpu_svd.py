@@ -65,6 +65,9 @@ def filter_svd_3d_gpu(
 
     n_frames = int(data.shape[0])
     spatial = data.shape[1:]
+    # Start from a clean allocator so repeated calls (e.g. per-shard loops) don't
+    # accumulate retained pool blocks and OOM the card.
+    cp.get_default_memory_pool().free_all_blocks()
     mat = cp.asarray(data, dtype=cp.complex64).reshape(n_frames, -1)
     n_vox = mat.shape[1]
 
@@ -116,7 +119,7 @@ def filter_svd_3d_gpu(
         mat[:, s0:s0 + voxel_chunk] = uc @ (uc_h @ mc)
 
     out = cp.asnumpy(mat).reshape((n_frames, *spatial))
-    del mat, G
+    del mat, G, uc, uc_h, mc  # drop loop-views too, else mat is never reclaimed
     cp.get_default_memory_pool().free_all_blocks()
     if squeeze:
         out = out[:, 0]
