@@ -280,22 +280,39 @@ def probe(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float = 2
 # download — CPU. Pull the full 98GB to the volume (resumable). Only after approval.
 # --------------------------------------------------------------------------- #
 @app.function(image=cpu_image, timeout=6 * 3600, volumes={"/root/data": vol})
-def download(url: str = SAMPLE_URL) -> dict:
+def download(url: str = SAMPLE_URL, max_attempts: int = 80) -> dict:
+    """Resume-until-VERIFIED-COMPLETE download. R2's public endpoint silently
+    drops large transfers (urllib read() returns empty EOF without error), so a
+    single pass truncates. Loop download_sample (each call resumes via HTTP Range)
+    and commit until the file size matches the remote Content-Length."""
     import os
     import sys
     import time
 
     sys.path.insert(0, "/workspace")
-    from ultratrace_ulm.download import download_sample
+    from ultratrace_ulm.download import _remote_size, download_sample
 
     _ensure_root()
     dest = _guard(f"{DATA_ROOT}/sanitized_neutral_ultratrace.h5")
+    total = _remote_size(url)
     t0 = time.time()
-    # Commit periodically so an eviction mid-download keeps the resumable partial.
-    download_sample(url, dest)
-    vol.commit()
-    size = os.path.getsize(dest)
-    return {"dest": dest, "bytes": size, "GiB": round(size / 2**30, 2), "seconds": round(time.time() - t0, 1)}
+    size = os.path.getsize(dest) if os.path.exists(dest) else 0
+    for attempt in range(max_attempts):
+        if total and size >= total:
+            break
+        try:
+            download_sample(url, dest)  # resumes from current size
+        except Exception as e:  # noqa: BLE001 - network drop; retry
+            print(f"[download] attempt {attempt} dropped: {e}", flush=True)
+        vol.commit()
+        new = os.path.getsize(dest)
+        print(f"[download] attempt {attempt}: {new/2**30:.1f}/{(total or 0)/2**30:.1f} GiB", flush=True)
+        if new == size and (not total or new < total):
+            time.sleep(2)  # no progress; brief backoff before retry
+        size = new
+    complete = bool(total and size >= total)
+    return {"dest": dest, "bytes": size, "GiB": round(size / 2**30, 2), "total_GiB": round((total or 0) / 2**30, 2),
+            "complete": complete, "attempts": attempt + 1, "seconds": round(time.time() - t0, 1)}
 
 
 def _build_config(h5, elev_planes: int):
