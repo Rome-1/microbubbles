@@ -380,9 +380,16 @@ def beamform_iq(
 
     if stream_accumulate:
         # Sum angles into one host accumulator: peak host ~2x the volume, not Ax.
+        # Free each angle's device output (and return pool blocks) before mach
+        # allocates the next, or the cupy pool holds two 11.9GB outputs at once
+        # and OOMs a 24GB GPU. Peak device ~ iq + one output (~13GB).
         acc = None
+        mempool = cp.get_default_memory_pool()
         for angle_idx in range(num_angles):
-            contrib = cp.asnumpy(_angle_bf(angle_idx))
+            bf = _angle_bf(angle_idx)
+            contrib = cp.asnumpy(bf)
+            del bf
+            mempool.free_all_blocks()
             acc = contrib if acc is None else acc + contrib
             del contrib
         compound = acc  # (z, elev, x, F)
