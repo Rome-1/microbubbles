@@ -720,6 +720,83 @@ def _iter_compounds_h5(beamformed_path: Path, selected: list[int]):
             yield int(acq_id), load_compound(h5, acq_id), gx, gy, gz
 
 
+def detect_localize_acq(compound, grid_x, grid_y, grid_z, opts: TrackingOptions,
+                        filter_fn=None, detect_fn=None) -> dict:
+    """Filter + detect + sub-voxel localize ONE acquisition's compound into flat
+    per-detection arrays (mb-crr: checkpointable unit). Mirrors the per-acq body
+    of _run_selected; returns positions in mm + frame-within-acq, so Phase-B
+    tracking can rebuild detections_by_frame from per-acq checkpoints."""
+    filtered = (filter_fn or _filter_acquisition)(compound, opts)
+    batch = (detect_fn or detect_batch)(
+        filtered, sigma_threshold=opts.sigma_threshold,
+        min_distance=opts.min_distance, smoothing_sigma=opts.smoothing_sigma,
+    )
+    batch = _knee_filter_batch(batch, opts)
+    n_frames = int(filtered.shape[0])
+    pos, ints, zs, fia = [], [], [], []
+    for frame_in_acq, (pixels, intensities, zscores) in enumerate(batch):
+        if len(pixels) == 0:
+            continue
+        subpix = subpixel_localize_3d(filtered[frame_in_acq], pixels,
+                                      method=opts.subpixel, window_size=opts.window_size)
+        positions = indices_to_mm(subpix, grid_x, grid_y, grid_z)
+        pos.append(positions)
+        ints.append(np.asarray(intensities, dtype=np.float32))
+        zs.append(np.asarray(zscores, dtype=np.float32))
+        fia.append(np.full(len(positions), frame_in_acq, dtype=np.int32))
+    cat = lambda xs, w: (np.concatenate(xs) if xs else np.empty((0, w) if w else 0, dtype=np.float32))
+    return {
+        "positions_mm": cat(pos, 3),
+        "intensities": cat(ints, 0),
+        "zscores": cat(zs, 0),
+        "frame_in_acq": (np.concatenate(fia) if fia else np.empty(0, dtype=np.int32)),
+        "n_frames": n_frames,
+    }
+
+
+def track_from_acq_detections(per_acq: list[dict], opts: TrackingOptions,
+                              spacing: dict, output_path: Path,
+                              extra: dict | None = None) -> Path:
+    """Phase-B: rebuild detections_by_frame from ordered per-acq checkpoints and
+    run one cross-acq tracking pass (reproduces the baseline's tracking)."""
+    detections_by_frame, intensities_by_frame = [], []
+    frames_per_acq = 0
+    for d in per_acq:
+        pos = np.asarray(d["positions_mm"], dtype=np.float32)
+        inten = np.asarray(d["intensities"], dtype=np.float32)
+        fia = np.asarray(d["frame_in_acq"], dtype=np.int32)
+        nf = int(d["n_frames"])
+        frames_per_acq = frames_per_acq or nf
+        for f in range(nf):
+            m = fia == f
+            detections_by_frame.append(pos[m] if m.any() else np.empty((0, 3), dtype=np.float32))
+            intensities_by_frame.append(inten[m] if m.any() else np.empty(0, dtype=np.float32))
+    tracks = _track_detections(detections_by_frame, intensities_by_frame, opts, spacing)
+    data = {
+        "tracks": tracks,
+        "detections_by_frame": detections_by_frame,
+        "intensities_by_frame": intensities_by_frame,
+        "spacing": spacing,
+        "n_acquisitions": len(per_acq),
+        "frames_per_acq": int(frames_per_acq),
+        "n_frames": int(len(detections_by_frame)),
+        "params": {
+            "frame_rate_hz": opts.frame_rate_hz,
+            "max_distance_mm": _tracking_gate(opts, spacing),
+            "tracking_method": opts.tracking,
+            "max_gap": int(opts.max_gap),
+            "max_cost": float(opts.max_cost),
+            "gate_on_prediction": bool(opts.gate_on_prediction),
+            "min_track_length": int(opts.min_track_length),
+            **(extra or {}),
+        },
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    dump_pickle(data, output_path)
+    print(f"Wrote {len(tracks)} tracks -> {output_path}")
+    return output_path
+
+
 def _run_selected(
     opts: TrackingOptions,
     selected: list[int],

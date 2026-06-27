@@ -681,6 +681,222 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
     return report
 
 
+def _open_local_or_remote_h5(url: str):
+    """Prefer the downloaded volume copy (reliable local reads); fall back to
+    lazy HTTP. Returns (h5, fobj_or_None, source)."""
+    import os
+
+    import h5py
+
+    local = f"{DATA_ROOT}/sanitized_neutral_ultratrace.h5"
+    if os.path.exists(local):
+        return h5py.File(local, "r"), None, "local"
+    h5, fobj = _open_remote_h5(url)
+    return h5, fobj, "remote"
+
+
+# --------------------------------------------------------------------------- #
+# detect_acqs (Phase A) — GPU, CHECKPOINTED + ADDITIVE + INSTRUMENTED. Per acq:
+# read -> beamform(+motion) -> filter -> detect -> localize -> save a tiny npz of
+# localizations. Skips acqs already done (resume); new acqs append (additive). A
+# timeout/stall only loses the current acq. Logs per-stage timings so we can SEE
+# where time goes (the 12h-timeout post-mortem). Prefers the local downloaded h5.
+# --------------------------------------------------------------------------- #
+@app.function(image=gpu_image, gpu="A10G", timeout=12 * 3600, memory=98304,
+              volumes={"/root/data": vol})
+def detect_acqs(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float = 222.0,
+                spatial_tgc: bool = True, tgc_acqs: int = 12, tgc_sigma_lambda: float = 9.0,
+                tgc_svd_cut: float = 0.05, acq_start: int = 0, num_acqs: int = 0, acq_step: int = 1,
+                svd_method: str = "adaptive", motion: bool = False, filter_variant: str = "global",
+                n_z_blocks: int = 3, n_x_blocks: int = 3, keep_orders: str = "", tag: str = "baseline") -> dict:
+    import json
+    import os
+    import sys
+    import time
+    from pathlib import Path
+
+    import h5py
+    import numpy as np
+
+    sys.path.insert(0, "/workspace")
+    from ultratrace_ulm.beamform_core import beamform_iq
+    from ultratrace_ulm.gpu_detect import detect_batch_gpu
+    from ultratrace_ulm.gpu_svd import filtered_magnitude_gpu
+    from ultratrace_ulm.tracking import TrackingOptions, _grid_spacing, detect_localize_acq
+
+    _ensure_root()
+    det_dir = _guard(f"{DATA_ROOT}/detections/{tag}")
+    ref_dir = _guard(f"{DATA_ROOT}/beamformed/{tag}_refs")
+    os.makedirs(det_dir, exist_ok=True)
+    os.makedirs(ref_dir, exist_ok=True)
+    keep = {int(x) for x in keep_orders.split(",") if x.strip() != ""}
+
+    h5, fobj, source = _open_local_or_remote_h5(url)
+    print(f"[detect_acqs] source={source} tag={tag}", flush=True)
+    all_ids = sorted(int(k) for k in h5["acquisitions"].keys() if str(k).isdigit())
+    sel = all_ids[acq_start::acq_step]
+    if num_acqs and num_acqs > 0:
+        sel = sel[:num_acqs]
+    config = _build_config(h5, elev_planes)
+
+    def _read(aid):
+        g = h5[f"acquisitions/{aid}"]
+        return (np.asarray(g["iq_frames"], dtype=np.complex64),
+                np.asarray(g["tx_delays"], dtype=np.float64),
+                np.asarray(g["tx_delays_elev"], dtype=np.float64))
+
+    def gpu_filter(comp, o):
+        if filter_variant == "region":
+            from ultratrace_ulm.gpu_svd_region import filtered_magnitude_region_gpu
+            return filtered_magnitude_region_gpu(
+                comp, low_cutoff=o.svd_low_cutoff, method=o.svd_method,
+                frame_rate_hz=o.frame_rate_hz, tissue_freq_hz=o.tissue_freq_hz,
+                n_z_blocks=n_z_blocks, n_x_blocks=n_x_blocks)
+        return filtered_magnitude_gpu(comp, low_cutoff=o.svd_low_cutoff, method=o.svd_method,
+                                      frame_rate_hz=o.frame_rate_hz, tissue_freq_hz=o.tissue_freq_hz)
+
+    opts = TrackingOptions(
+        beamformed_path=Path(f"{DATA_ROOT}/none"), tracks_path=Path(det_dir) / "x.pkl",
+        svd_method=svd_method, knee_filter=True, tissue_freq_hz=100.0, temporal_sigma=0.0,
+        filter_method="svd", svd_low_cutoff=0.1, sigma_threshold=2.0, min_distance=2,
+        smoothing_sigma=1.0, subpixel="centroid", window_size=5, tracking="kalman",
+        frame_rate_hz=frame_rate_hz)
+
+    # ---- TGC: compute once, cache inv_sqrt.npy on the volume (resumable). ----
+    inv_path = os.path.join(det_dir, "inv_sqrt.npy")
+    inv_sqrt = None
+    if spatial_tgc:
+        if os.path.exists(inv_path):
+            inv_sqrt = np.load(inv_path)
+            print("[tgc] loaded cached inv_sqrt", flush=True)
+        else:
+            from scipy.ndimage import gaussian_filter
+
+            from ultratrace_ulm.gpu_svd import filter_svd_3d_gpu
+            idx = np.unique(np.linspace(0, len(sel) - 1, min(tgc_acqs, len(sel))).round().astype(int))
+            pd_sum, ref_grid = None, None
+            for aid in [sel[i] for i in idx]:
+                iq, txd, txde = _read(aid)
+                comp, ref_grid = beamform_iq(iq, txd, txde, config, stream_accumulate=True)
+                out = filter_svd_3d_gpu(comp, low_cutoff=tgc_svd_cut, method="fast")
+                pd = (np.abs(out) ** 2).mean(0)
+                pd_sum = pd if pd_sum is None else pd_sum + pd
+                del comp, out
+            pd_mean = pd_sum / len(idx)
+            z_ax, y_ax, x_ax = ref_grid.z[:, 0, 0], ref_grid.y[0, :, 0], ref_grid.x[0, 0, :]
+            sm = tgc_sigma_lambda * (1540.0 / config.tx_freq_hz)
+            dz = abs(z_ax[1] - z_ax[0]) if len(z_ax) > 1 else None
+            dx = abs(x_ax[1] - x_ax[0]) if len(x_ax) > 1 else None
+            dy = abs(y_ax[1] - y_ax[0]) if len(y_ax) > 1 else None
+            sig = (sm / dy if (dy and dy > 0) else 0.0, sm / dz if dz else 0.0, sm / dx if dx else 0.0)
+            tgc = gaussian_filter(pd_mean, sigma=sig).astype(np.float32)
+            inv_sqrt = (1.0 / np.sqrt(np.maximum(tgc, np.finfo(np.float32).eps)))[None]
+            np.save(inv_path, inv_sqrt)
+            vol.commit()
+
+    timings = []
+    try:
+        for order, aid in enumerate(sel):
+            out_npz = os.path.join(det_dir, f"acq_{order:04d}.npz")
+            if os.path.exists(out_npz):
+                continue
+            t0 = time.time(); iq, txd, txde = _read(aid); t_read = time.time() - t0
+            t0 = time.time()
+            comp, grid = beamform_iq(iq, txd, txde, config, stream_accumulate=True)
+            if inv_sqrt is not None:
+                comp = (comp * inv_sqrt).astype(np.complex64)
+            if motion:
+                from ultratrace_ulm.gpu_motion import correct_motion_gpu
+                comp, _ = correct_motion_gpu(comp)
+            t_bf = time.time() - t0
+            gx = (np.transpose(grid.x, (1, 0, 2)) * 1000.0).astype(np.float32)
+            gy = (np.transpose(grid.y, (1, 0, 2)) * 1000.0).astype(np.float32)
+            gz = (np.transpose(grid.z, (1, 0, 2)) * 1000.0).astype(np.float32)
+            t0 = time.time()
+            d = detect_localize_acq(comp, gx, gy, gz, opts, filter_fn=gpu_filter, detect_fn=detect_batch_gpu)
+            t_det = time.time() - t0
+            if not os.path.exists(os.path.join(det_dir, "meta.json")):
+                with open(os.path.join(det_dir, "meta.json"), "w") as fh:
+                    json.dump({"spacing": _grid_spacing(gx, gy, gz), "frames_per_acq": int(d["n_frames"]),
+                               "frame_rate_hz": frame_rate_hz, "motion": motion,
+                               "filter_variant": filter_variant, "svd_method": svd_method}, fh)
+            tmp = out_npz + ".tmp"
+            with open(tmp, "wb") as fh:
+                np.savez(fh, positions_mm=d["positions_mm"], intensities=d["intensities"],
+                         frame_in_acq=d["frame_in_acq"], n_frames=d["n_frames"], src_acq_id=int(aid))
+            os.replace(tmp, out_npz)
+            if order in keep:
+                with h5py.File(os.path.join(ref_dir, f"acq_{order:04d}.h5"), "w") as o:
+                    m = o.require_group(f"acquisitions/{order}/meta")
+                    m.create_dataset("compound_image", data=comp, chunks=(1,) + tuple(comp.shape[1:]), compression="lzf")
+                    gg = m.require_group("grid")
+                    for ax, arr in (("x", grid.x), ("y", grid.y), ("z", grid.z)):
+                        gg.create_dataset(ax, data=arr.astype(np.float64), compression="lzf")
+            vol.commit()
+            timings.append([round(t_read, 1), round(t_bf, 1), round(t_det, 1)])
+            print(f"[detect] order={order} acq={aid} read={t_read:.1f}s beamform+motion={t_bf:.1f}s "
+                  f"filter+detect={t_det:.1f}s ndet={len(d['positions_mm'])}", flush=True)
+    finally:
+        h5.close()
+        if fobj is not None:
+            fobj.close()
+    done = len([f for f in os.listdir(det_dir) if f.startswith("acq_") and f.endswith(".npz")])
+    tarr = np.array(timings) if timings else np.zeros((1, 3))
+    report = {"tag": tag, "source": source, "selected": len(sel), "checkpoints_total": done,
+              "this_run_processed": len(timings),
+              "median_s": {"read": float(np.median(tarr[:, 0])), "beamform_motion": float(np.median(tarr[:, 1])),
+                           "filter_detect": float(np.median(tarr[:, 2]))}}
+    print(json.dumps(report, indent=2))
+    return report
+
+
+# --------------------------------------------------------------------------- #
+# track_acqs (Phase B) — CPU, cheap. Track from ALL per-acq detection
+# checkpoints for a tag (additive: re-run after adding more acqs). Produces the
+# same tracks/bins as the fused baseline, but the expensive part can never be
+# lost to a timeout.
+# --------------------------------------------------------------------------- #
+@app.function(image=cpu_image, timeout=4 * 3600, memory=49152, volumes={"/root/data": vol})
+def track_acqs(tag: str = "baseline", min_track_length: int = 5,
+               gate_on_prediction: bool = False, out_tag: str = "") -> dict:
+    import json
+    import os
+    import sys
+    from pathlib import Path
+
+    import numpy as np
+
+    sys.path.insert(0, "/workspace")
+    from ultratrace_ulm.tracking import (
+        TrackingOptions, _smooth_and_export, track_from_acq_detections,
+    )
+
+    vol.reload()
+    det_dir = f"{DATA_ROOT}/detections/{tag}"
+    meta = json.load(open(os.path.join(det_dir, "meta.json")))
+    files = sorted(f for f in os.listdir(det_dir) if f.startswith("acq_") and f.endswith(".npz"))
+    per_acq = []
+    for f in files:
+        z = np.load(os.path.join(det_dir, f))
+        per_acq.append({k: z[k] for k in ("positions_mm", "intensities", "frame_in_acq", "n_frames")})
+    out_tag = out_tag or tag
+    out_dir = Path(_guard(f"{DATA_ROOT}/tracks/{out_tag}"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    opts = TrackingOptions(
+        beamformed_path=Path(f"{DATA_ROOT}/none"), tracks_path=out_dir / "tracks.pkl",
+        tracking="kalman", frame_rate_hz=meta["frame_rate_hz"], max_gap=3,
+        min_track_length=min_track_length, reversal_penalty=10.0, max_cost=10.0,
+        gate_on_prediction=gate_on_prediction, smooth_sigma=2.0, smooth_method="gaussian",
+        export_dir=out_dir, export_stem="tracks", export_min_lengths=(5, 20, 50))
+    tracks_pkl = track_from_acq_detections(per_acq, opts, meta["spacing"], opts.tracks_path,
+                                           extra={"from_detections": tag, **meta})
+    smoothed = _smooth_and_export(opts, tracks_pkl)
+    vol.commit()
+    n = len(per_acq)
+    print(f"DONE track_acqs {tag}: {n} acqs -> {out_dir}")
+    return {"out_tag": out_tag, "n_acqs": n, "smoothed": str(smoothed)}
+
+
 # --------------------------------------------------------------------------- #
 # retrack — CPU, ~free. Re-run tracking on a baseline run's STORED detections
 # with an insight's tracking-stage change (e.g. predicted-state Kalman gate),
@@ -867,7 +1083,7 @@ def main(fn: str = "inspect"):
         "inspect": inspect, "probe": probe, "download": download,
         "beamform_all": beamform_all, "consolidate": consolidate, "track": track,
         "baseline": baseline, "validate_svd": validate_svd, "volume3d": volume3d,
-        "retrack": retrack,
+        "retrack": retrack, "detect_acqs": detect_acqs, "track_acqs": track_acqs,
     }
     if fn not in table:
         raise SystemExit(f"unknown fn {fn!r}; choose from {sorted(table)}")
