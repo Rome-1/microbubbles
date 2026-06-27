@@ -668,6 +668,59 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
 
 
 # --------------------------------------------------------------------------- #
+# retrack — CPU, ~free. Re-run tracking on a baseline run's STORED detections
+# with an insight's tracking-stage change (e.g. predicted-state Kalman gate),
+# without re-beamforming. The cheap-insight engine for all tracking-stage diffs.
+# --------------------------------------------------------------------------- #
+@app.function(image=cpu_image, timeout=3600, memory=49152, volumes={"/root/data": vol})
+def retrack(baseline_tag: str = "baseline", out_tag: str = "kalman_pred",
+            gate_on_prediction: bool = True, min_track_length: int = 5) -> dict:
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, "/workspace")
+    from ultratrace_ulm.runtime import dump_pickle, load_pickle
+    from ultratrace_ulm.tracking import (
+        TrackingOptions, _track_detections, export_tracks_bin, smooth_tracks_pickle,
+    )
+
+    vol.reload()
+    src = Path(f"{DATA_ROOT}/tracks/{baseline_tag}/tracks.pkl")
+    data = load_pickle(src)
+    det = data.get("detections_by_frame")
+    inten = data.get("intensities_by_frame")
+    if det is None:
+        raise SystemExit(f"{src} has no detections_by_frame (re-run baseline keeps them)")
+    spacing = data.get("spacing") or {}
+    p = data.get("params", {})
+    md = p.get("max_distance_mm")
+    opts = TrackingOptions(
+        beamformed_path=Path(f"{DATA_ROOT}/none"),
+        tracks_path=Path(f"{DATA_ROOT}/tracks/{out_tag}/tracks.pkl"),
+        tracking=p.get("tracking_method", "kalman"),
+        max_dist=tuple(float(v) for v in md) if md else None,
+        frame_rate_hz=p.get("frame_rate_hz"), max_gap=int(p.get("max_gap", 3)),
+        min_track_length=min_track_length, reversal_penalty=10.0,
+        max_cost=float(p.get("max_cost", 10.0)), gate_on_prediction=gate_on_prediction,
+        smooth_sigma=2.0, smooth_method="gaussian", export_min_lengths=(5, 20, 50),
+    )
+    out_dir = Path(_guard(f"{DATA_ROOT}/tracks/{out_tag}"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tracks = _track_detections(det, inten, opts, spacing)
+    out = dict(data)
+    out["tracks"] = tracks
+    out.setdefault("params", {})
+    out["params"] = {**p, "retrack_from": baseline_tag, "gate_on_prediction": gate_on_prediction}
+    dump_pickle(out, opts.tracks_path)
+    smoothed = smooth_tracks_pickle(opts.tracks_path, None, sigma=2.0, method="gaussian")
+    for ml in (5, 20, 50):
+        export_tracks_bin(smoothed, out_dir / f"tracks_min{ml}.bin", min_length=ml)
+    vol.commit()
+    print(f"DONE retrack {baseline_tag}->{out_tag}: {len(tracks)} tracks")
+    return {"out_tag": out_tag, "n_tracks": len(tracks), "gate_on_prediction": gate_on_prediction}
+
+
+# --------------------------------------------------------------------------- #
 # volume3d — GPU. Reduce reference beamformed shards to small 3D SVD power
 # volumes (time-mean |filtered|^2), ~8.5MB each, that CAN be pulled local for
 # browser/MIP viewing and baseline-vs-insight diffing. The DIFFVIZ backbone.
@@ -789,6 +842,7 @@ def main(fn: str = "inspect"):
         "inspect": inspect, "probe": probe, "download": download,
         "beamform_all": beamform_all, "consolidate": consolidate, "track": track,
         "baseline": baseline, "validate_svd": validate_svd, "volume3d": volume3d,
+        "retrack": retrack,
     }
     if fn not in table:
         raise SystemExit(f"unknown fn {fn!r}; choose from {sorted(table)}")
