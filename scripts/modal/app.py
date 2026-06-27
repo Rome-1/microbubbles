@@ -518,7 +518,9 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
              tgc_svd_cut: float = 0.05, acq_start: int = 0, num_acqs: int = 0,
              acq_step: int = 1, keep_orders: str = "0,74,148,222",
              min_track_length: int = 5, svd_method: str = "adaptive",
-             use_gpu_svd: bool = True, tag: str = "baseline") -> dict:
+             use_gpu_svd: bool = True, motion: bool = False,
+             filter_variant: str = "global", gate_on_prediction: bool = False,
+             n_z_blocks: int = 3, n_x_blocks: int = 3, tag: str = "baseline") -> dict:
     import json
     import os
     import sys
@@ -600,6 +602,9 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
             comp, grid = beamform_iq(iq, txd, txde, config, stream_accumulate=True)
             if inv_sqrt is not None:
                 comp = (comp * inv_sqrt).astype(np.complex64)
+            if motion:
+                from ultratrace_ulm.gpu_motion import correct_motion_gpu
+                comp, _shifts = correct_motion_gpu(comp)
             times.append(time.time() - t0)
             if order in keep:
                 shard = os.path.join(ref_dir, f"acq_{order:04d}.h5")
@@ -628,7 +633,8 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
         filter_method="svd", svd_low_cutoff=0.1, sigma_threshold=2.0, min_distance=2,
         smoothing_sigma=1.0, subpixel="centroid", window_size=5, tracking="kalman",
         frame_rate_hz=frame_rate_hz, max_gap=3, min_track_length=min_track_length,
-        reversal_penalty=10.0, max_cost=10.0, smooth_sigma=2.0, smooth_method="gaussian",
+        reversal_penalty=10.0, max_cost=10.0, gate_on_prediction=gate_on_prediction,
+        smooth_sigma=2.0, smooth_method="gaussian",
         export_dir=out_dir, export_stem="tracks", export_min_lengths=(5, 20, 50),
     )
     gpu_filter = gpu_detect = None
@@ -637,6 +643,14 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
         from ultratrace_ulm.gpu_svd import filtered_magnitude_gpu
 
         def gpu_filter(compound, o):
+            if filter_variant == "region":
+                from ultratrace_ulm.gpu_svd_region import filtered_magnitude_region_gpu
+                return filtered_magnitude_region_gpu(
+                    compound, low_cutoff=o.svd_low_cutoff, high_cutoff=o.svd_high_cutoff,
+                    method=o.svd_method, temporal_sigma=o.temporal_sigma,
+                    n_components=o.svd_n_components, frame_rate_hz=o.frame_rate_hz,
+                    tissue_freq_hz=o.tissue_freq_hz, n_z_blocks=n_z_blocks, n_x_blocks=n_x_blocks,
+                )
             return filtered_magnitude_gpu(
                 compound, low_cutoff=o.svd_low_cutoff, high_cutoff=o.svd_high_cutoff,
                 method=o.svd_method, temporal_sigma=o.temporal_sigma,
