@@ -24,20 +24,26 @@ def spectral_centroid_cutoff(
     frequency; the cutoff is the first vector whose centroid exceeds
     ``tissue_freq_hz`` (Ghosh et al., PNAS 2025). Falls back to 10% of frames.
     ``matrix`` is the (frames, voxels) temporal matrix.
+
+    DETERMINISM FIX (mb-crr.2): the singular vectors are complex and a Hermitian
+    eigensolver returns each only up to an arbitrary unit-phase. The shipped code
+    measured ``|rfft(u.real)|^2``, which is phase-DEPENDENT -- so the cutoff (and
+    thus the whole clutter filter) silently changed with the LAPACK/cuSOLVER
+    phase convention (CPU and GPU disagreed by ~15x in track count). We instead
+    use the phase-INVARIANT full complex spectrum ``|fft(u)|^2`` with the centroid
+    taken over ``|freq|``. This is deterministic, GPU/CPU-consistent, and the
+    physically correct frequency content of a complex (signed-Doppler) mode.
     """
     n_frames = int(matrix.shape[0])
     x = matrix - matrix.mean(axis=0, keepdims=True)
     cov = x @ x.conj().T
     evals, u = np.linalg.eigh(cov)
     u = u[:, np.argsort(evals)[::-1]]
-    freqs = np.fft.rfftfreq(n_frames, d=1.0 / frame_rate_hz)
-    centroid = np.zeros(n_frames)
-    for i in range(n_frames):
-        spectrum = np.abs(np.fft.rfft(u[:, i].real)) ** 2
-        spectrum[0] = 0.0  # exclude DC
-        total = spectrum.sum()
-        if total > 0:
-            centroid[i] = float(np.sum(freqs * spectrum) / total)
+    freqs = np.fft.fftfreq(n_frames, d=1.0 / frame_rate_hz)
+    spec = np.abs(np.fft.fft(u, axis=0)) ** 2  # (F, F) phase-invariant
+    spec[0, :] = 0.0  # exclude DC
+    total = spec.sum(axis=0)
+    centroid = (np.abs(freqs)[:, None] * spec).sum(axis=0) / np.where(total > 0, total, 1.0)
     above = np.where(centroid > tissue_freq_hz)[0]
     return int(above[0]) if len(above) else max(1, round(n_frames * 0.1))
 

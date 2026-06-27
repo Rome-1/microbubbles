@@ -22,18 +22,19 @@ from .svd import _component_count
 
 
 def _spectral_centroid_cutoff_gpu(gram_centered, n_frames, frame_rate_hz, tissue_freq_hz):
-    """Cutoff from the temporal spectral centroid, mirroring
-    ``svd.spectral_centroid_cutoff`` but vectorised on the GPU. ``gram_centered``
-    is the Gram matrix of the MEAN-SUBTRACTED temporal matrix (x @ x^H)."""
+    """Cutoff from the temporal spectral centroid, matching
+    ``svd.spectral_centroid_cutoff`` exactly (phase-INVARIANT complex spectrum,
+    centroid over |freq| -- see that function's DETERMINISM FIX note).
+    ``gram_centered`` is the Gram of the MEAN-SUBTRACTED temporal matrix."""
     import cupy as cp
 
     evals, u = cp.linalg.eigh(gram_centered)
     u = u[:, cp.argsort(evals)[::-1]]  # (F, F), columns = temporal singular vectors
-    freqs = cp.fft.rfftfreq(n_frames, d=1.0 / frame_rate_hz)
-    spec = cp.abs(cp.fft.rfft(u.real, axis=0)) ** 2  # (Frfft, F)
+    freqs = cp.fft.fftfreq(n_frames, d=1.0 / frame_rate_hz)
+    spec = cp.abs(cp.fft.fft(u, axis=0)) ** 2  # (F, F) phase-invariant
     spec[0, :] = 0.0  # exclude DC
     total = spec.sum(axis=0)
-    centroid = (freqs[:, None] * spec).sum(axis=0) / cp.where(total > 0, total, 1.0)
+    centroid = (cp.abs(freqs)[:, None] * spec).sum(axis=0) / cp.where(total > 0, total, 1.0)
     above = cp.where(centroid > tissue_freq_hz)[0]
     if above.size:
         return int(above[0].item())

@@ -699,12 +699,13 @@ def validate_svd(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: fl
                                            frame_rate_hz, 100.0))
     mat = cp.asarray(comp, dtype=cp.complex64).reshape(F, -1)
     Gc = cp.zeros((F, F), dtype=cp.complex64)
+    mc = xc = None
     for s0 in range(0, mat.shape[1], 300_000):
         mc = mat[:, s0:s0 + 300_000]
         xc = mc - mc.mean(axis=0, keepdims=True)
         Gc += xc @ xc.conj().T
     gpu_low = int(_spectral_centroid_cutoff_gpu(Gc, F, frame_rate_hz, 100.0))
-    del mat, Gc
+    del mat, Gc, mc, xc  # drop the loop-view refs too, else mat stays alive
     cp.get_default_memory_pool().free_all_blocks()
 
     cpu_mag = filtered_magnitude(comp, method="adaptive", frame_rate_hz=frame_rate_hz, tissue_freq_hz=100.0)
