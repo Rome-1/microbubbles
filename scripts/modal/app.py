@@ -631,8 +631,9 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
         reversal_penalty=10.0, max_cost=10.0, smooth_sigma=2.0, smooth_method="gaussian",
         export_dir=out_dir, export_stem="tracks", export_min_lengths=(5, 20, 50),
     )
-    gpu_filter = None
+    gpu_filter = gpu_detect = None
     if use_gpu_svd:
+        from ultratrace_ulm.gpu_detect import detect_batch_gpu
         from ultratrace_ulm.gpu_svd import filtered_magnitude_gpu
 
         def gpu_filter(compound, o):
@@ -643,9 +644,11 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
                 tissue_freq_hz=o.tissue_freq_hz,
             )
 
+        gpu_detect = detect_batch_gpu
+
     try:
         smoothed = run_tracking_outputs_streamed(
-            opts, [int(a) for a in sel], _provider(), filter_fn=gpu_filter,
+            opts, [int(a) for a in sel], _provider(), filter_fn=gpu_filter, detect_fn=gpu_detect,
         )
     finally:
         h5.close()

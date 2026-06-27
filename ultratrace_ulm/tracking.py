@@ -716,6 +716,7 @@ def _run_selected(
     output_path: Path,
     compound_iter=None,
     filter_fn=None,
+    detect_fn=None,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     detections_by_frame: list[np.ndarray] = []
@@ -734,7 +735,7 @@ def _run_selected(
         if frames_per_acq == 0:
             frames_per_acq = int(compound.shape[0])
         filtered = (filter_fn or _filter_acquisition)(compound, opts)
-        batch = detect_batch(
+        batch = (detect_fn or detect_batch)(
             filtered,
             sigma_threshold=opts.sigma_threshold,
             min_distance=opts.min_distance,
@@ -1191,7 +1192,7 @@ def run_tracking_outputs(opts: TrackingOptions) -> Path:
 
 
 def run_tracking_outputs_streamed(
-    opts: TrackingOptions, selected: list[int], compound_iter, filter_fn=None,
+    opts: TrackingOptions, selected: list[int], compound_iter, filter_fn=None, detect_fn=None,
 ) -> Path:
     """Fused path (mb-crr.2/.4): track from a per-acq compound provider instead of
     a beamformed H5 file. ``compound_iter`` yields (acq_id, compound, gx, gy, gz);
@@ -1200,7 +1201,8 @@ def run_tracking_outputs_streamed(
     ``_filter_acquisition``. Produces the same tracks/smoothing/bins as the H5 path;
     used to fuse beamform->track so the 11.9GB/acq volume is never persisted."""
     tracks = _run_selected(
-        opts, selected, opts.tracks_path, compound_iter=compound_iter, filter_fn=filter_fn,
+        opts, selected, opts.tracks_path, compound_iter=compound_iter,
+        filter_fn=filter_fn, detect_fn=detect_fn,
     )
     return _smooth_and_export(opts, tracks)
 
