@@ -728,7 +728,9 @@ def retrack(baseline_tag: str = "baseline", out_tag: str = "kalman_pred",
 @app.function(image=gpu_image, gpu="A10G", timeout=3600, memory=65536,
               volumes={"/root/data": vol})
 def volume3d(refs_dir: str = "baseline_refs", svd_method: str = "adaptive",
-             frame_rate_hz: float = 222.0, low_cutoff: float = 0.1, tag: str = "baseline") -> dict:
+             frame_rate_hz: float = 222.0, low_cutoff: float = 0.1,
+             filter_mode: str = "global", motion: bool = False,
+             n_z_blocks: int = 3, n_x_blocks: int = 3, tag: str = "baseline") -> dict:
     import os
     import sys
 
@@ -752,8 +754,17 @@ def volume3d(refs_dir: str = "baseline_refs", svd_method: str = "adaptive",
             gx = np.asarray(f[f"acquisitions/{order}/meta/grid/x"])  # (z, elev, x) meters
             gy = np.asarray(f[f"acquisitions/{order}/meta/grid/y"])
             gz = np.asarray(f[f"acquisitions/{order}/meta/grid/z"])
-        filt = filter_svd_3d_gpu(comp, low_cutoff=low_cutoff, method=svd_method,
-                                 frame_rate_hz=frame_rate_hz, tissue_freq_hz=100.0)
+        if motion:
+            from ultratrace_ulm.gpu_motion import correct_motion_gpu
+            comp, _shifts = correct_motion_gpu(comp)
+        if filter_mode == "region":
+            from ultratrace_ulm.gpu_svd_region import filter_svd_3d_region_gpu
+            filt = filter_svd_3d_region_gpu(
+                comp, n_z_blocks=n_z_blocks, n_x_blocks=n_x_blocks, low_cutoff=low_cutoff,
+                method=svd_method, frame_rate_hz=frame_rate_hz, tissue_freq_hz=100.0)
+        else:
+            filt = filter_svd_3d_gpu(comp, low_cutoff=low_cutoff, method=svd_method,
+                                     frame_rate_hz=frame_rate_hz, tissue_freq_hz=100.0)
         power = (np.abs(filt) ** 2).mean(0).astype(np.float32)  # (elev, z, x), ~8.5MB
         base = fn[:-3]
         np.save(os.path.join(out, f"{base}_power.npy"), power)

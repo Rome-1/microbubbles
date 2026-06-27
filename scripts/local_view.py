@@ -76,28 +76,35 @@ def render_diff(base_path: Path, insight_path: Path, out_path: Path):
     ins = np.load(insight_path)
     if base.shape != ins.shape:
         raise SystemExit(f"shape mismatch: baseline {base.shape} vs insight {ins.shape}")
-    # Coronal MIP (max over elevation) is the standard ULM vascular view.
-    b = base.max(axis=0).T
-    i = ins.max(axis=0).T
-    bn, inn = _logn(b), _logn(i)
-    diff = inn - bn  # signed, in normalised-log space
-    lim = float(np.abs(diff).max()) or 1.0
-
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    axes[0].imshow(bn, origin="lower", cmap="inferno", aspect="auto"); axes[0].set_title("baseline")
-    axes[1].imshow(inn, origin="lower", cmap="inferno", aspect="auto"); axes[1].set_title("insight")
-    im = axes[2].imshow(diff, origin="lower", cmap="seismic", vmin=-lim, vmax=lim, aspect="auto")
-    axes[2].set_title("insight − baseline (red=more, blue=less)")
-    for ax in axes:
-        ax.set_xticks([]); ax.set_yticks([])
-    fig.colorbar(im, ax=axes[2], fraction=0.046)
-    frac = float((np.abs(diff) > 0.05 * lim).mean())
-    fig.suptitle(f"DIFF coronal MIP — {insight_path.parent.name} vs baseline "
-                 f"(changed area {frac:.1%})", fontsize=12)
+    # 3 ortho planes x {baseline, insight, signed diff}. Sagittal/axial carry the
+    # depth-structured clutter banding, so show all three (not just coronal).
+    planes = {
+        "coronal [z x]": (base.max(0).T, ins.max(0).T),
+        "sagittal [z elev]": (base.max(2), ins.max(2)),   # (elev,z)->row elev
+        "axial [x elev]": (base.max(1), ins.max(1)),
+    }
+    fig, axes = plt.subplots(3, 3, figsize=(16, 12))
+    for r, (title, (b, i)) in enumerate(planes.items()):
+        bn, inn = _logn(b), _logn(i)
+        diff = inn - bn
+        lim = float(np.abs(diff).max()) or 1.0
+        axes[r, 0].imshow(bn, origin="lower", cmap="inferno", aspect="auto")
+        axes[r, 0].set_ylabel(title, fontsize=10)
+        axes[r, 1].imshow(inn, origin="lower", cmap="inferno", aspect="auto")
+        im = axes[r, 2].imshow(diff, origin="lower", cmap="seismic", vmin=-lim, vmax=lim, aspect="auto")
+        fig.colorbar(im, ax=axes[r, 2], fraction=0.046)
+        if r == 0:
+            axes[r, 0].set_title("baseline"); axes[r, 1].set_title("insight")
+            axes[r, 2].set_title("insight − baseline (red=more, blue=less)")
+        for c in range(3):
+            axes[r, c].set_xticks([]); axes[r, c].set_yticks([])
+    cor = _logn(planes["coronal [z x]"][1]) - _logn(planes["coronal [z x]"][0])
+    frac = float((np.abs(cor) > 0.05 * (np.abs(cor).max() or 1)).mean())
+    fig.suptitle(f"DIFF (3 planes) — {insight_path.parent.name} vs baseline", fontsize=13)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=120)
-    print(f"wrote {out_path}  (changed area {frac:.1%}, max|diff| {lim:.3g})")
+    fig.savefig(out_path, dpi=110)
+    print(f"wrote {out_path}  (coronal changed area {frac:.1%})")
 
 
 def load_bin(path: Path):
