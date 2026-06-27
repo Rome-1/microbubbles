@@ -664,6 +664,52 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
     return report
 
 
+# --------------------------------------------------------------------------- #
+# volume3d — GPU. Reduce reference beamformed shards to small 3D SVD power
+# volumes (time-mean |filtered|^2), ~8.5MB each, that CAN be pulled local for
+# browser/MIP viewing and baseline-vs-insight diffing. The DIFFVIZ backbone.
+# --------------------------------------------------------------------------- #
+@app.function(image=gpu_image, gpu="A10G", timeout=3600, memory=65536,
+              volumes={"/root/data": vol})
+def volume3d(refs_dir: str = "baseline_refs", svd_method: str = "adaptive",
+             frame_rate_hz: float = 222.0, low_cutoff: float = 0.1, tag: str = "baseline") -> dict:
+    import os
+    import sys
+
+    import h5py
+    import numpy as np
+
+    sys.path.insert(0, "/workspace")
+    from ultratrace_ulm.gpu_svd import filter_svd_3d_gpu
+
+    vol.reload()
+    src = f"{DATA_ROOT}/beamformed/{refs_dir}"
+    out = _guard(f"{DATA_ROOT}/viz/{tag}")
+    os.makedirs(out, exist_ok=True)
+    arts = []
+    for fn in sorted(f for f in os.listdir(src) if f.endswith(".h5")):
+        with h5py.File(os.path.join(src, fn), "r") as f:
+            order = sorted(f["acquisitions"].keys(), key=int)[0]
+            comp = np.asarray(f[f"acquisitions/{order}/meta/compound_image"], dtype=np.complex64)
+            gx = np.asarray(f[f"acquisitions/{order}/meta/grid/x"])  # (z, elev, x) meters
+            gy = np.asarray(f[f"acquisitions/{order}/meta/grid/y"])
+            gz = np.asarray(f[f"acquisitions/{order}/meta/grid/z"])
+        filt = filter_svd_3d_gpu(comp, low_cutoff=low_cutoff, method=svd_method,
+                                 frame_rate_hz=frame_rate_hz, tissue_freq_hz=100.0)
+        power = (np.abs(filt) ** 2).mean(0).astype(np.float32)  # (elev, z, x), ~8.5MB
+        base = fn[:-3]
+        np.save(os.path.join(out, f"{base}_power.npy"), power)
+        np.savez(os.path.join(out, f"{base}_axes.npz"),
+                 z=(gz[:, 0, 0] * 1000).astype(np.float32),
+                 elev=(gy[0, :, 0] * 1000).astype(np.float32),
+                 x=(gx[0, 0, :] * 1000).astype(np.float32))
+        arts.append(f"{base}_power.npy")
+        vol.commit()
+        print(f"[volume3d] {base}: power {power.shape} max={float(power.max()):.3g}", flush=True)
+    print(f"DONE volume3d: {len(arts)} volumes -> viz/{tag}")
+    return {"out": f"{DATA_ROOT}/viz/{tag}", "svd_method": svd_method, "artifacts": arts}
+
+
 @app.function(image=gpu_image, gpu="A10G", timeout=1800, memory=98304,
               volumes={"/root/data": vol})
 def validate_svd(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float = 222.0) -> dict:
@@ -735,7 +781,7 @@ def main(fn: str = "inspect"):
     table = {
         "inspect": inspect, "probe": probe, "download": download,
         "beamform_all": beamform_all, "consolidate": consolidate, "track": track,
-        "baseline": baseline, "validate_svd": validate_svd,
+        "baseline": baseline, "validate_svd": validate_svd, "volume3d": volume3d,
     }
     if fn not in table:
         raise SystemExit(f"unknown fn {fn!r}; choose from {sorted(table)}")
