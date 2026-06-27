@@ -71,14 +71,19 @@ def filter_svd_3d_gpu(
     # Two Gram matrices in one pass: G (raw) drives the projection; Gc
     # (mean-subtracted) drives the adaptive cutoff -- matching the CPU code,
     # where spectral_centroid_cutoff mean-subtracts but the projection does not.
-    G = cp.zeros((n_frames, n_frames), dtype=cp.complex64)
-    Gc = cp.zeros((n_frames, n_frames), dtype=cp.complex64) if method == "adaptive" else None
+    # Accumulate in complex128: removing the top-k of n components leaves a small
+    # residual that is ill-conditioned near the eigenvalue boundary, so float32
+    # accumulation over ~2M voxels visibly perturbs which modes are kept. float64
+    # makes the Gram (and thus the canonical baseline) stable and reproducible.
+    G = cp.zeros((n_frames, n_frames), dtype=cp.complex128)
+    Gc = cp.zeros((n_frames, n_frames), dtype=cp.complex128) if method == "adaptive" else None
     for s0 in range(0, n_vox, voxel_chunk):
-        mc = mat[:, s0:s0 + voxel_chunk]
+        mc = mat[:, s0:s0 + voxel_chunk].astype(cp.complex128)
         G += mc @ mc.conj().T
         if Gc is not None:
             xc = mc - mc.mean(axis=0, keepdims=True)
             Gc += xc @ xc.conj().T
+        del mc
 
     if method == "adaptive":
         if frame_rate_hz is None:
@@ -97,10 +102,10 @@ def filter_svd_3d_gpu(
     if low + high_remove >= n_frames:
         raise ValueError(f"SVD cutoff removes all components: low={low}, high={high_cutoff}")
 
-    evals, u = cp.linalg.eigh(G)
+    evals, u = cp.linalg.eigh(G)   # complex128
     u = u[:, cp.argsort(evals)[::-1]]
     stop = n_frames - high_remove if high_remove > 0 else n_frames
-    uc = u[:, low:stop]            # (F, k)
+    uc = u[:, low:stop].astype(cp.complex64)  # (F, k); project in complex64
     uc_h = uc.conj().T             # (k, F)
     # Project in place per chunk: filtered[:,c] = uc @ (uc^H @ mat[:,c]).
     for s0 in range(0, n_vox, voxel_chunk):
