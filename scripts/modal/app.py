@@ -511,7 +511,7 @@ def track(beamformed: str = "baseline.h5", frame_rate_hz: float = 222.0,
 # Persists only: tracks (tiny) + compressed shards for a few reference acqs (for
 # the 3D volume viewer + diffs). This is the storage-sane baseline producer.
 # --------------------------------------------------------------------------- #
-@app.function(image=gpu_image, gpu="A10G", timeout=12 * 3600, memory=131072,
+@app.function(image=gpu_image, gpu="A10G", timeout=12 * 3600, memory=98304,
               volumes={"/root/data": vol})
 def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float = 222.0,
              spatial_tgc: bool = True, tgc_acqs: int = 12, tgc_sigma_lambda: float = 9.0,
