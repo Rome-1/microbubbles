@@ -100,6 +100,48 @@ def render_diff(base_path: Path, insight_path: Path, out_path: Path):
     print(f"wrote {out_path}  (changed area {frac:.1%}, max|diff| {lim:.3g})")
 
 
+def load_bin(path: Path):
+    """Parse a tracks_min*.bin (the compact ULM track export)."""
+    import struct
+
+    raw = path.read_bytes()
+    magic, ver, n_tracks, total_points, max_speed = struct.unpack_from("<IIIIf", raw, 0)
+    bmin = struct.unpack_from("<3f", raw, 20)
+    bmax = struct.unpack_from("<3f", raw, 32)
+    off = 64 + n_tracks * 12  # 64B header + per-track index (offset,length,acq,pad)
+    pts = np.frombuffer(raw, dtype="<f4", count=total_points * 5, offset=off).reshape(total_points, 5)
+    return pts, np.array(bmin), np.array(bmax), int(n_tracks), float(max_speed)
+
+
+def _hist(a, b, abins, bbins, bins=300):
+    h, _, _ = np.histogram2d(a, b, bins=bins, range=[abins, bbins])
+    return h
+
+
+def render_tracks(bin_path: Path, out_path: Path):
+    """ULM track-density MIPs: histogram all track points in 3 ortho planes.
+    This is the actual vascular render (vs the SVD power volume)."""
+    pts, bmin, bmax, n_tracks, max_speed = load_bin(bin_path)
+    x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+    xr, yr, zr = [float(bmin[0]), float(bmax[0])], [float(bmin[1]), float(bmax[1])], [float(bmin[2]), float(bmax[2])]
+    panels = {
+        "coronal [x z]": (_hist(x, z, xr, zr), "x (mm)", "z (mm)"),
+        "axial [x y]": (_hist(x, y, xr, yr), "x (mm)", "y (mm)"),
+        "sagittal [z y]": (_hist(z, y, zr, yr), "z (mm)", "y (mm)"),
+    }
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    for ax, (title, (h, xl, yl)) in zip(axes, panels.items()):
+        ax.imshow(np.log1p(h).T, origin="lower", cmap="magma", aspect="auto")
+        ax.set_title(title, fontsize=10); ax.set_xlabel(xl); ax.set_ylabel(yl)
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle(f"ULM track density — {bin_path.name} "
+                 f"({n_tracks} tracks, {len(pts)} pts)", fontsize=12)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    print(f"wrote {out_path}  ({n_tracks} tracks, {len(pts)} points)")
+
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -108,9 +150,13 @@ def main():
     d = sub.add_parser("diff")
     d.add_argument("baseline"); d.add_argument("insight")
     d.add_argument("--axes", default=None); d.add_argument("--out", required=True)
+    t = sub.add_parser("tracks")
+    t.add_argument("bin"); t.add_argument("--out", required=True)
     a = p.parse_args()
     if a.cmd == "volume":
         render_volume(Path(a.power), Path(a.axes) if a.axes else None, Path(a.out))
+    elif a.cmd == "tracks":
+        render_tracks(Path(a.bin), Path(a.out))
     else:
         render_diff(Path(a.baseline), Path(a.insight), Path(a.out))
 
