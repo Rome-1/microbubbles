@@ -678,6 +678,10 @@ def _knee_filter_batch(batch: list, opts: TrackingOptions) -> list:
     """Drop per-acquisition detections below the z-score knee (adaptive mode)."""
     if not (opts.knee_filter and opts.svd_method == "adaptive"):
         return batch
+    if any(len(frame) != 3 for frame in batch):
+        # Low-confidence detector variants carry a fourth confidence array. Keep
+        # those continuation candidates intact; the high/low split is the filter.
+        return batch
     zs_all = [z for (_, _, z) in batch if len(z)]
     if not zs_all:
         return batch
@@ -733,8 +737,14 @@ def detect_localize_acq(compound, grid_x, grid_y, grid_z, opts: TrackingOptions,
     )
     batch = _knee_filter_batch(batch, opts)
     n_frames = int(filtered.shape[0])
-    pos, ints, zs, fia = [], [], [], []
-    for frame_in_acq, (pixels, intensities, zscores) in enumerate(batch):
+    has_confidence = any(len(frame) == 4 for frame in batch)
+    pos, ints, zs, confs, fia = [], [], [], [], []
+    for frame_in_acq, frame in enumerate(batch):
+        if len(frame) == 4:
+            pixels, intensities, zscores, confidence = frame
+        else:
+            pixels, intensities, zscores = frame
+            confidence = None
         if len(pixels) == 0:
             continue
         subpix = subpixel_localize_3d(filtered[frame_in_acq], pixels,
@@ -743,15 +753,23 @@ def detect_localize_acq(compound, grid_x, grid_y, grid_z, opts: TrackingOptions,
         pos.append(positions)
         ints.append(np.asarray(intensities, dtype=np.float32))
         zs.append(np.asarray(zscores, dtype=np.float32))
+        if has_confidence:
+            if confidence is None:
+                confs.append(np.ones(len(positions), dtype=np.uint8))
+            else:
+                confs.append(np.asarray(confidence, dtype=np.uint8))
         fia.append(np.full(len(positions), frame_in_acq, dtype=np.int32))
     cat = lambda xs, w: (np.concatenate(xs) if xs else np.empty((0, w) if w else 0, dtype=np.float32))
-    return {
+    out = {
         "positions_mm": cat(pos, 3),
         "intensities": cat(ints, 0),
         "zscores": cat(zs, 0),
         "frame_in_acq": (np.concatenate(fia) if fia else np.empty(0, dtype=np.int32)),
         "n_frames": n_frames,
     }
+    if has_confidence:
+        out["confidence"] = np.concatenate(confs) if confs else np.empty(0, dtype=np.uint8)
+    return out
 
 
 def track_from_acq_detections(per_acq: list[dict], opts: TrackingOptions,

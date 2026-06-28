@@ -725,7 +725,9 @@ def detect_acqs(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: flo
                 spatial_tgc: bool = True, tgc_acqs: int = 12, tgc_sigma_lambda: float = 9.0,
                 tgc_svd_cut: float = 0.05, acq_start: int = 0, num_acqs: int = 0, acq_step: int = 1,
                 svd_method: str = "adaptive", motion: bool = False, filter_variant: str = "global",
-                n_z_blocks: int = 3, n_x_blocks: int = 3, keep_orders: str = "", tag: str = "baseline") -> dict:
+                n_z_blocks: int = 3, n_x_blocks: int = 3, keep_orders: str = "", tag: str = "baseline",
+                detector: str = "zscore", svd_rank: bool | str = False, rank_delta: float = 2.0,
+                nms_elev: int = 0, elev_debias: bool = False, low_conf: bool = False) -> dict:
     import json
     import os
     import sys
@@ -755,6 +757,16 @@ def detect_acqs(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: flo
     if num_acqs and num_acqs > 0:
         sel = sel[:num_acqs]
     config = _build_config(h5, elev_planes)
+    detector = str(detector).lower()
+    if detector not in {"zscore", "cfar", "psf"}:
+        raise ValueError("detector must be one of: zscore, cfar, psf")
+    if isinstance(svd_rank, str):
+        rank_arg = svd_rank.strip().lower()
+        use_svd_rank = rank_arg not in {"", "0", "false", "no", "off", "none"}
+        rank_method = rank_arg if rank_arg in {"elbow", "energy"} else "elbow"
+    else:
+        use_svd_rank = bool(svd_rank)
+        rank_method = "elbow"
 
     def _read(aid):
         g = h5[f"acquisitions/{aid}"]
@@ -763,6 +775,23 @@ def detect_acqs(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: flo
                 np.asarray(g["tx_delays_elev"], dtype=np.float64))
 
     def gpu_filter(comp, o):
+        if use_svd_rank:
+            from ultratrace_ulm.svd_rank import filter_svd_3d_region_ranked_gpu
+
+            filtered, _kmap, _raw = filter_svd_3d_region_ranked_gpu(
+                comp,
+                n_z_blocks=n_z_blocks,
+                n_x_blocks=n_x_blocks,
+                rank_method=rank_method,
+                delta=float(rank_delta),
+                high_cutoff=o.svd_high_cutoff,
+            )
+            mag = np.abs(filtered).astype(np.float32, copy=False)
+            if o.temporal_sigma > 0:
+                from scipy.ndimage import gaussian_filter1d
+
+                mag = gaussian_filter1d(mag, sigma=o.temporal_sigma, axis=0)
+            return mag
         if filter_variant == "region":
             from ultratrace_ulm.gpu_svd_region import filtered_magnitude_region_gpu
             return filtered_magnitude_region_gpu(
@@ -778,6 +807,74 @@ def detect_acqs(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: flo
         filter_method="svd", svd_low_cutoff=0.1, sigma_threshold=2.0, min_distance=2,
         smoothing_sigma=1.0, subpixel="centroid", window_size=5, tracking="kalman",
         frame_rate_hz=frame_rate_hz)
+
+    def _with_confidence(batch, high_threshold: float):
+        out = []
+        for pixels, intensities, zscores in batch:
+            conf = (np.asarray(zscores) >= float(high_threshold)).astype(np.uint8, copy=False)
+            out.append((pixels, intensities, zscores, conf))
+        return out
+
+    def _detect_zscore(magnitude, sigma_threshold, min_distance, smoothing_sigma):
+        threshold = max(0.0, float(sigma_threshold) - 1.0) if low_conf else float(sigma_threshold)
+        batch = detect_batch_gpu(magnitude, threshold, min_distance, smoothing_sigma)
+        return _with_confidence(batch, sigma_threshold) if low_conf else batch
+
+    def _nms_radius(min_distance: int):
+        if int(nms_elev) > 0:
+            return (int(nms_elev), int(min_distance), int(min_distance))
+        return (int(min_distance), int(min_distance), int(min_distance))
+
+    def _detect_cfar(magnitude, sigma_threshold, min_distance, smoothing_sigma):
+        from ultratrace_ulm.detect_cfar import detect_batch_cfar_gpu
+
+        threshold = max(0.0, float(sigma_threshold) - 1.0) if low_conf else float(sigma_threshold)
+        batch = detect_batch_cfar_gpu(
+            magnitude,
+            sigma_threshold=threshold,
+            min_distance=min_distance,
+            smoothing_sigma=smoothing_sigma,
+            nms_radius=_nms_radius(min_distance),
+            debias=bool(elev_debias),
+        )
+        return _with_confidence(batch, sigma_threshold) if low_conf else batch
+
+    def _detect_psf(magnitude, sigma_threshold, min_distance, smoothing_sigma):
+        from ultratrace_ulm.psf import detect_batch_matched_filter_gpu, estimate_empirical_psf
+
+        pilot = detect_batch_gpu(
+            magnitude,
+            max(float(sigma_threshold), 5.0),
+            min_distance,
+            smoothing_sigma,
+        )
+        try:
+            psf = estimate_empirical_psf(
+                magnitude,
+                pilot,
+                min_zscore=max(float(sigma_threshold), 5.0),
+            )
+        except ValueError:
+            threshold = max(0.0, float(sigma_threshold) - 1.0) if low_conf else float(sigma_threshold)
+            batch = detect_batch_gpu(magnitude, threshold, min_distance, smoothing_sigma)
+        else:
+            threshold = max(0.0, float(sigma_threshold) - 1.0) if low_conf else float(sigma_threshold)
+            batch = detect_batch_matched_filter_gpu(
+                magnitude,
+                sigma_threshold=threshold,
+                min_distance=min_distance,
+                smoothing_sigma=smoothing_sigma,
+                psf=psf,
+                nms_radius=_nms_radius(min_distance),
+                debias=bool(elev_debias),
+            )
+        return _with_confidence(batch, sigma_threshold) if low_conf else batch
+
+    detect_fn = {
+        "zscore": _detect_zscore,
+        "cfar": _detect_cfar,
+        "psf": _detect_psf,
+    }[detector]
 
     # ---- TGC: compute once, cache inv_sqrt.npy on the volume (resumable). ----
     inv_path = os.path.join(det_dir, "inv_sqrt.npy")
@@ -830,17 +927,39 @@ def detect_acqs(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: flo
             gy = (np.transpose(grid.y, (1, 0, 2)) * 1000.0).astype(np.float32)
             gz = (np.transpose(grid.z, (1, 0, 2)) * 1000.0).astype(np.float32)
             t0 = time.time()
-            d = detect_localize_acq(comp, gx, gy, gz, opts, filter_fn=gpu_filter, detect_fn=detect_batch_gpu)
+            d = detect_localize_acq(comp, gx, gy, gz, opts, filter_fn=gpu_filter, detect_fn=detect_fn)
             t_det = time.time() - t0
             if not os.path.exists(os.path.join(det_dir, "meta.json")):
+                meta = {"spacing": _grid_spacing(gx, gy, gz), "frames_per_acq": int(d["n_frames"]),
+                        "frame_rate_hz": frame_rate_hz, "motion": motion,
+                        "filter_variant": filter_variant, "svd_method": svd_method}
+                if (
+                    detector != "zscore" or use_svd_rank or int(nms_elev) > 0
+                    or bool(elev_debias) or bool(low_conf)
+                ):
+                    meta.update({
+                        "detector": detector,
+                        "svd_rank": bool(use_svd_rank),
+                        "rank_method": rank_method if use_svd_rank else "",
+                        "rank_delta": float(rank_delta),
+                        "nms_elev": int(nms_elev),
+                        "elev_debias": bool(elev_debias),
+                        "low_conf": bool(low_conf),
+                    })
                 with open(os.path.join(det_dir, "meta.json"), "w") as fh:
-                    json.dump({"spacing": _grid_spacing(gx, gy, gz), "frames_per_acq": int(d["n_frames"]),
-                               "frame_rate_hz": frame_rate_hz, "motion": motion,
-                               "filter_variant": filter_variant, "svd_method": svd_method}, fh)
+                    json.dump(meta, fh)
             tmp = out_npz + ".tmp"
+            arrays = {
+                "positions_mm": d["positions_mm"],
+                "intensities": d["intensities"],
+                "frame_in_acq": d["frame_in_acq"],
+                "n_frames": d["n_frames"],
+                "src_acq_id": int(aid),
+            }
+            if low_conf:
+                arrays["confidence"] = d.get("confidence", np.empty(0, dtype=np.uint8))
             with open(tmp, "wb") as fh:
-                np.savez(fh, positions_mm=d["positions_mm"], intensities=d["intensities"],
-                         frame_in_acq=d["frame_in_acq"], n_frames=d["n_frames"], src_acq_id=int(aid))
+                np.savez(fh, **arrays)
             os.replace(tmp, out_npz)
             if order in keep:
                 with h5py.File(os.path.join(ref_dir, f"acq_{order:04d}.h5"), "w") as o:
@@ -863,6 +982,10 @@ def detect_acqs(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: flo
               "this_run_processed": len(timings),
               "median_s": {"read": float(np.median(tarr[:, 0])), "beamform_motion": float(np.median(tarr[:, 1])),
                            "filter_detect": float(np.median(tarr[:, 2]))}}
+    if detector != "zscore" or use_svd_rank or int(nms_elev) > 0 or bool(elev_debias) or bool(low_conf):
+        report.update({"detector": detector, "svd_rank": bool(use_svd_rank), "rank_delta": float(rank_delta),
+                       "nms_elev": int(nms_elev), "elev_debias": bool(elev_debias),
+                       "low_conf": bool(low_conf)})
     print(json.dumps(report, indent=2))
     return report
 
@@ -889,13 +1012,16 @@ def track_acqs(tag: str = "baseline", min_track_length: int = 5,
     )
 
     vol.reload()
-    det_dir = f"{DATA_ROOT}/detections/{tag}"
+    det_dir = _guard(f"{DATA_ROOT}/detections/{tag}")
     meta = json.load(open(os.path.join(det_dir, "meta.json")))
     files = sorted(f for f in os.listdir(det_dir) if f.startswith("acq_") and f.endswith(".npz"))
     per_acq = []
     for f in files:
         z = np.load(os.path.join(det_dir, f))
-        per_acq.append({k: z[k] for k in ("positions_mm", "intensities", "frame_in_acq", "n_frames")})
+        item = {k: z[k] for k in ("positions_mm", "intensities", "frame_in_acq", "n_frames")}
+        if "confidence" in z:
+            item["confidence"] = z["confidence"]
+        per_acq.append(item)
     out_tag = out_tag or tag
     out_dir = Path(_guard(f"{DATA_ROOT}/tracks/{out_tag}"))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -965,6 +1091,54 @@ def retrack(baseline_tag: str = "baseline", out_tag: str = "kalman_pred",
     vol.commit()
     print(f"DONE retrack {baseline_tag}->{out_tag}: {len(tracks)} tracks")
     return {"out_tag": out_tag, "n_tracks": len(tracks), "gate_on_prediction": gate_on_prediction}
+
+
+# --------------------------------------------------------------------------- #
+# stitch — CPU, cheap. Post-hoc stitch a saved track pickle and export viewer
+# bins so stitched vs baseline can be compared without re-running detection.
+# --------------------------------------------------------------------------- #
+@app.function(image=cpu_image, timeout=1800, memory=16384, volumes={"/root/data": vol})
+def stitch(tag: str = "baseline", out_tag: str = "", max_gap: int = 12,
+           tol_lateral_mm: float = 0.6, tol_elev_mm: float = 2.0,
+           vel_cos_min: float = 0.3, intensity_log_tol: float = 1.5,
+           max_cost: float = 1.0) -> dict:
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, "/workspace")
+    from ultratrace_ulm.runtime import dump_pickle, load_pickle
+    from ultratrace_ulm.track_stitch import stitch_pickle_data
+    from ultratrace_ulm.tracking import export_tracks_bin
+
+    vol.reload()
+    _ensure_root()
+    out_tag = out_tag or f"{tag}_stitched"
+    src = Path(_guard(f"{DATA_ROOT}/tracks/{tag}/tracks.pkl"))
+    out_dir = Path(_guard(f"{DATA_ROOT}/tracks/{out_tag}"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "tracks.pkl"
+    data = load_pickle(src)
+    stitched = stitch_pickle_data(
+        data,
+        max_gap=max_gap,
+        tol_lateral_mm=tol_lateral_mm,
+        tol_elev_mm=tol_elev_mm,
+        vel_cos_min=vel_cos_min,
+        intensity_log_tol=intensity_log_tol,
+        max_cost=max_cost,
+    )
+    dump_pickle(stitched, out_path)
+    exports = []
+    for min_length in (5, 20, 50):
+        exported = export_tracks_bin(out_path, out_dir / f"tracks_min{min_length}.bin", min_length=min_length)
+        if exported is not None:
+            exports.append(str(exported))
+    vol.commit()
+    n_in = len(data.get("tracks_smoothed") or data.get("tracks") or [])
+    n_out = len(stitched.get("tracks_smoothed") or stitched.get("tracks") or [])
+    print(f"DONE stitch {tag}->{out_tag}: {n_in} -> {n_out} tracks")
+    return {"tag": tag, "out_tag": out_tag, "tracks_path": str(out_path),
+            "n_tracks_in": n_in, "n_tracks_out": n_out, "exports": exports}
 
 
 # --------------------------------------------------------------------------- #
@@ -1094,13 +1268,15 @@ def main(fn: str = "inspect"):
     """Convenience: `modal run scripts/modal/app.py` runs inspect by default.
 
     Prefer explicit `modal run scripts/modal/app.py::<fn>` for inspect / probe /
-    download / beamform_all / consolidate / track / baseline.
+    download / beamform_all / consolidate / track / baseline / detect_acqs /
+    track_acqs / stitch.
     """
     table = {
         "inspect": inspect, "probe": probe, "download": download,
         "beamform_all": beamform_all, "consolidate": consolidate, "track": track,
         "baseline": baseline, "validate_svd": validate_svd, "volume3d": volume3d,
         "retrack": retrack, "detect_acqs": detect_acqs, "track_acqs": track_acqs,
+        "stitch": stitch,
     }
     if fn not in table:
         raise SystemExit(f"unknown fn {fn!r}; choose from {sorted(table)}")

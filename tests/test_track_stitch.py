@@ -1,5 +1,5 @@
-"""Local test for post-hoc track stitching (agreed idea #1)."""
 import numpy as np
+import pytest
 
 from ultratrace_ulm.track_stitch import stitch_tracks
 
@@ -48,3 +48,37 @@ def test_velocity_disagreement_blocks_stitch():
     b = _track([0.1 * 9, 0, 8], [-0.1, 0, 0], 10, 8)
     out = stitch_tracks([a, b], max_gap=12)
     assert len(out) == 2
+
+
+def test_parallel_nearby_distinct_bubbles_do_not_false_merge():
+    # Distinct bubbles can be nearly indistinguishable in x/z over a dropout gap.
+    # This is the specific false-merge risk: the loose elevation tolerance accepts
+    # a separate but parallel bubble and inflates track length.
+    vel = np.array([0.05, 0.0, 0.05])
+    a = _track([0, 0.0, 8], vel, 0, 8)
+    predicted_after_gap = np.asarray([0, 0.0, 8]) + vel * 11
+    b = _track([predicted_after_gap[0], 1.5, predicted_after_gap[2]], vel, 11, 8)
+    out = stitch_tracks([a, b], max_gap=12)
+    assert len(out) == 2
+
+
+def test_crossing_fragments_keep_velocity_consistent_links():
+    # Two bubbles cross near the seam. Position-only stitching would allow an ID
+    # swap, but the velocity-agreement gate should reject the swapped links.
+    vel_a = np.array([0.1, 0.0, 0.0])
+    vel_b = np.array([-0.1, 0.0, 0.0])
+    a0 = _track([0.0, 0.0, 8.0], vel_a, 0, 8)
+    b0 = _track([1.4, 0.0, 8.0], vel_b, 0, 8)
+    a1 = _track([1.0, 0.0, 8.0], vel_a, 10, 8)
+    b1 = _track([0.4, 0.0, 8.0], vel_b, 10, 8)
+
+    out = stitch_tracks([a0, b0, a1, b1], max_gap=12)
+
+    assert len(out) == 2
+    assert sorted(t.get("stitched_from", 1) for t in out) == [2, 2]
+    velocities = []
+    for track in out:
+        pos = np.asarray(track["positions"])
+        frames = np.asarray(track["frames"])
+        velocities.append((pos[-1, 0] - pos[0, 0]) / (frames[-1] - frames[0]))
+    assert sorted(np.sign(v) for v in velocities) == [-1.0, 1.0]
