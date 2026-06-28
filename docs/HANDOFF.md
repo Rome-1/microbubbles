@@ -80,5 +80,17 @@ Codex=detection/SVD; both cross-checked each other (Codex found + Opus fixed a r
 - Literature deep-dives running → `docs/literature/lit-detection-svd.md`, `lit-tracking-eval.md`
   (scientific basis for the knob values).
 
+## Literature-grounded knob settings (next session — see `docs/literature/`)
+Two cited reviews (`lit-detection-svd.md` = full Opus deep-dive; `lit-knobs-grounding.md` = Codex summary):
+- **SVD cutoff is the big one:** ours floors to ~70 modes (10% of 700), but tissue is only a
+  FEW-to-low-TENS of modes → **we over-remove → THIS is the coverage-loss cause.** Switch to a
+  data-driven knee (singular-value gradient + spatial-vector correlation) + a separate high-order
+  noise cutoff. Likely beats per-block rank for coverage. (Demené 2015, Baranger 2018, Lok/Song 2020.)
+- **Stitch `vel_cos_min`: 0.8** (applied; was 0.3 → over-merge). 0.7 permissive edge.
+- **Detection: two-tier** — spawn at 4–6σ, continue at 3.5–4.5σ (FN costs ~45% SSIM vs FP ~7% → bias sensitive).
+- **Elevation: down-weight** — Kalman `R_yy` ×5–10 (test ×15–25 for our 1-row aperture), Mahalanobis gate, 2D-first.
+- **max_gap sweep 4/6/8; SVD-rank delta sweep 0/4/8/12.**
+- **First no-GT metric to add to bench.py: split-half FRC/FSC reproducibility** (the over-merge arbiter).
+
 ## Budget
 ~$50 of $100 spent (biggest: the 12-hr timeout ~$13, the full-223 baseline). GPU bake-offs ~$2.5 each.
