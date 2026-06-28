@@ -1206,13 +1206,14 @@ def volume3d(refs_dir: str = "baseline_refs", svd_method: str = "adaptive",
               volumes={"/root/data": vol})
 def validate_svd(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float = 222.0,
                  acq_index: int = 0, knee_high: bool = False) -> dict:
-    """SVD cutoff probe on one acq: CPU/GPU adaptive equivalence + the data-driven
-    knee (mb-3k4). Reports the singular-value spectrum head and the cutoff each
-    rule selects (adaptive-centroid vs knee vs fixed 10%) plus the detection count
-    each yields -- the cheap logged validation the bake-off plan calls for.
+    """SVD cutoff probe on one real acq (mb-3k4): reports the cutoff each rule
+    selects (legacy adaptive-centroid vs data-driven knee vs the fixed 10% floor),
+    the singular-value spectrum head, and the detection count adaptive vs knee --
+    the cheap logged validation the bake-off plan calls for.
 
-    Reads the acq from the local volume copy (HTTP range reads of ~1 GB IQ can be
-    silently truncated by R2)."""
+    GPU-only (the CPU<->GPU adaptive equivalence was validated in mb-crr.2; the CPU
+    full-SVD path is ~5 min and adds nothing to the knee question). Reads the acq
+    from the local volume copy (HTTP range reads of ~1 GB IQ can be R2-truncated)."""
     import json
     import sys
 
@@ -1223,7 +1224,7 @@ def validate_svd(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: fl
 
     from ultratrace_ulm.beamform_core import beamform_iq
     from ultratrace_ulm.gpu_svd import _spectral_centroid_cutoff_gpu, filtered_magnitude_gpu
-    from ultratrace_ulm.svd import _component_count, filtered_magnitude, spectral_centroid_cutoff
+    from ultratrace_ulm.svd import _component_count
     from ultratrace_ulm.svd_knee import select_svd_cutoffs, singular_value_knee
     from ultratrace_ulm.tracking import detect_batch
 
@@ -1243,8 +1244,6 @@ def validate_svd(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: fl
         fobj.close()
 
     F = comp.shape[0]
-    cpu_low = int(spectral_centroid_cutoff(comp.reshape(F, -1).astype(np.complex64),
-                                           frame_rate_hz, 100.0))
     mat = cp.asarray(comp, dtype=cp.complex64).reshape(F, -1)
     n_vox = int(mat.shape[1])
     # raw Gram (the projection basis) for the spectrum + knee; mean-subtracted Gc
@@ -1257,7 +1256,7 @@ def validate_svd(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: fl
         G += (mc @ mc.conj().T).astype(cp.complex128)
         xc = mc - mc.mean(axis=0, keepdims=True)
         Gc += xc @ xc.conj().T
-    gpu_low = int(_spectral_centroid_cutoff_gpu(Gc, F, frame_rate_hz, 100.0))
+    adaptive_low = int(_spectral_centroid_cutoff_gpu(Gc, F, frame_rate_hz, 100.0))
     evals = cp.asnumpy(cp.linalg.eigvalsh(G).real)
     del mat, G, Gc, mc, xc
     cp.get_default_memory_pool().free_all_blocks()
@@ -1268,24 +1267,20 @@ def validate_svd(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: fl
         evals, F, n_vox, low_min=1, low_max=ceiling, high=bool(knee_high))
     knee_low_unguarded = singular_value_knee(svals, min_rank=1, max_rank=F - 1)
 
-    cpu_mag = filtered_magnitude(comp, method="adaptive", frame_rate_hz=frame_rate_hz, tissue_freq_hz=100.0)
-    gpu_mag = filtered_magnitude_gpu(comp, method="adaptive", frame_rate_hz=frame_rate_hz, tissue_freq_hz=100.0)
+    adaptive_mag = filtered_magnitude_gpu(comp, method="adaptive", frame_rate_hz=frame_rate_hz,
+                                          tissue_freq_hz=100.0)
     knee_mag = filtered_magnitude_gpu(comp, method="knee", low_cutoff=0.1, knee_high=bool(knee_high))
-    diff = np.abs(cpu_mag - gpu_mag)
-    denom = float(np.abs(cpu_mag).mean()) or 1.0
-    cpu_det = int(sum(len(p) for p, _, _ in detect_batch(cpu_mag, 2.0, 2, 1.0)))
-    gpu_det = int(sum(len(p) for p, _, _ in detect_batch(gpu_mag, 2.0, 2, 1.0)))
+    adaptive_det = int(sum(len(p) for p, _, _ in detect_batch(adaptive_mag, 2.0, 2, 1.0)))
     knee_det = int(sum(len(p) for p, _, _ in detect_batch(knee_mag, 2.0, 2, 1.0)))
     report = {
         "source": source, "acq_index": int(acq_index), "n_frames": F, "n_voxels": n_vox,
-        "adaptive_low_cpu": cpu_low, "adaptive_low_gpu": gpu_low, "fixed_floor_low": ceiling,
+        "adaptive_low": adaptive_low, "fixed_floor_low": ceiling,
         "knee_low": int(knee_low_guarded), "knee_low_unguarded": int(knee_low_unguarded),
         "knee_high_remove": int(knee_high_remove),
         "svals_head": [float(v) for v in svals[:25]],
         "svals_tail": [float(v) for v in svals[-5:]],
-        "max_abs_diff": float(diff.max()), "rel_mean_diff": float(diff.mean() / denom),
-        "adaptive_detections": gpu_det, "adaptive_detections_cpu": cpu_det,
-        "knee_detections": knee_det,
+        "adaptive_detections": adaptive_det, "knee_detections": knee_det,
+        "det_pct_change": round(100.0 * (knee_det - adaptive_det) / max(adaptive_det, 1), 1),
     }
     print(json.dumps(report, indent=2))
     return report
