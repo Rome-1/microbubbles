@@ -55,6 +55,12 @@ class TrackingOptions:
     elev_axis: int = 1  # which coordinate is elevation (x,y,z) -> y is index 1
     elev_meas_factor: float = 1.0  # multiply R[elev,elev] (>1 => smaller Kalman gain in y)
     elev_gate_factor: float = 1.0  # multiply the box-gate half-width along elevation
+    # mb-crr: intensity-aware association. A real bubble's echo intensity is roughly
+    # continuous frame-to-frame, so brightness is a free association cue. When >0 (and
+    # intensities are provided), the Hungarian cost gains an intensity-continuity term
+    # |log(cand) - log(track_ref)| that keeps a track matched to its own brightness at
+    # geometric ambiguities (crossings). 0.0 reproduces the geometry-only tracker exactly.
+    intensity_cost_weight: float = 0.0
     smooth_sigma: float = 2.0
     smooth_method: str = "gaussian"
     smooth_window: int = 5
@@ -241,6 +247,7 @@ def kalman_tracking_3d(
     elev_axis: int = 1,
     elev_meas_factor: float = 1.0,
     elev_gate_factor: float = 1.0,
+    intensity_cost_weight: float = 0.0,
 ) -> List[Dict]:
     """
     Track bubbles in 3D using Kalman filter + Hungarian assignment.
@@ -267,6 +274,17 @@ def kalman_tracking_3d(
         elev_gate_factor: Multiplier on the hard box-gate half-width along elevation.
                          >1 widens the elevation gate so larger elevation jumps reach the
                          Mahalanobis stage. 1.0 = isotropic (default).
+        intensity_cost_weight: Weight on an intensity-continuity term added to the
+                         Hungarian association cost. When >0 AND ``intensities`` are
+                         provided, each candidate pair pays
+                         ``intensity_cost_weight * |log(cand+eps) - log(ref+eps)|`` where
+                         ``ref`` is the track's reference intensity (an EMA of its matched
+                         intensities, alpha=0.3, seeded at spawn). The log makes the term
+                         scale-invariant to absolute brightness. This biases the tracker to
+                         match each track to detections of similar brightness, reducing
+                         identity swaps at geometric ambiguities. Tracks with no reference
+                         yet (length < 1) contribute 0. 0.0 = geometry-only (default,
+                         byte-identical to the prior behaviour).
 
     Returns:
         List of track dicts with 'positions', 'frames', 'length' (and 'intensities' if provided)
@@ -301,6 +319,13 @@ def kalman_tracking_3d(
     _lengths = np.empty(0, dtype=np.int64)
     _states = np.empty((0, 6))  # Kalman state [x,y,z,vx,vy,vz]
     _covs = np.empty((0, 6, 6))  # Kalman covariance P
+    # mb-crr: per-active-track reference intensity (parallel to the arrays above).
+    # Running EMA of each track's matched detection intensities, seeded at spawn.
+    # Maintained whenever intensities exist; only consumed when
+    # intensity_cost_weight > 0. NaN = no valid reference (spawned without intensity).
+    _int_ref = np.empty(0)
+    _INT_EMA_ALPHA = 0.3  # EMA weight on the newest matched intensity
+    _use_intensity_cost = bool(intensity_cost_weight > 0.0 and has_intensities)
 
     # Variable-length history per track (can't vectorize)
     _hist_pos = []  # list of lists of (3,) arrays
@@ -332,7 +357,7 @@ def kalman_tracking_3d(
 
     def _compact():
         """Remove tombstoned tracks, compacting arrays and lists."""
-        nonlocal _pos_last, _frame_last, _ages, _lengths, _states, _covs
+        nonlocal _pos_last, _frame_last, _ages, _lengths, _states, _covs, _int_ref
         nonlocal _hist_pos, _hist_fr, _hist_int, _n_dead
         if _n_dead == 0:
             return
@@ -343,6 +368,7 @@ def kalman_tracking_3d(
         _lengths = _lengths[keep]
         _states = _states[keep]
         _covs = _covs[keep]
+        _int_ref = _int_ref[keep]
         _hist_pos[:] = [h for h in _hist_pos if h is not None]
         _hist_fr[:] = [h for h in _hist_fr if h is not None]
         _hist_int[:] = [h for h in _hist_int if h is not None]
@@ -350,7 +376,7 @@ def kalman_tracking_3d(
 
     def _spawn(positions, frame_idx, det_int=None):
         """Create new tracks from unmatched detections."""
-        nonlocal _pos_last, _frame_last, _ages, _lengths, _states, _covs
+        nonlocal _pos_last, _frame_last, _ages, _lengths, _states, _covs, _int_ref
         nonlocal track_id_counter
         n = len(positions)
         if n == 0:
@@ -365,6 +391,12 @@ def kalman_tracking_3d(
         _lengths = np.concatenate([_lengths, np.ones(n, dtype=np.int64)])
         _states = np.concatenate([_states, new_states])
         _covs = np.concatenate([_covs, np.tile(P_init, (n, 1, 1))])
+        # Seed the reference intensity from the spawning detection (NaN if absent).
+        if has_intensities and det_int is not None:
+            new_int_ref = np.asarray(det_int, dtype=float).reshape(n)
+        else:
+            new_int_ref = np.full(n, np.nan)
+        _int_ref = np.concatenate([_int_ref, new_int_ref])
         for di in range(n):
             _hist_pos.append([positions[di].copy()])
             _hist_fr.append([frame_idx])
@@ -465,6 +497,19 @@ def kalman_tracking_3d(
 
         pair_costs = maha + momentum
 
+        # mb-crr: intensity-continuity cost (log -> scale-invariant to brightness).
+        if _use_intensity_cost:
+            eps = 1e-6
+            cand_int = cur_int[vj].astype(float)
+            ref_int = _int_ref[vi]  # global track idx -> reference intensity
+            intensity_cost = intensity_cost_weight * np.abs(
+                np.log(cand_int + eps) - np.log(ref_int + eps)
+            )
+            # Tracks without a usable reference (length < 1, or NaN ref) pay nothing.
+            no_ref = (_lengths[vi] < 1) | ~np.isfinite(ref_int)
+            intensity_cost = np.where(no_ref, 0.0, intensity_cost)
+            pair_costs = pair_costs + intensity_cost
+
         # ---- Reduced Hungarian: only include tracks/dets with valid pairs ----
         involved_tracks = np.unique(vi)
         involved_dets = np.unique(vj)
@@ -517,6 +562,15 @@ def kalman_tracking_3d(
             _frame_last[m_rows] = frame_idx
             _ages[m_rows] = 0
             _lengths[m_rows] += 1
+
+            # mb-crr: update each matched track's reference intensity (EMA, seeded
+            # at spawn). In sync with _states/_pos_last above; an in-place value
+            # update only (no length change), so _compact/_retire are unaffected.
+            if has_intensities:
+                matched_int = cur_int[m_cols].astype(float)
+                cur_ref = _int_ref[m_rows]
+                ema = (1.0 - _INT_EMA_ALPHA) * cur_ref + _INT_EMA_ALPHA * matched_int
+                _int_ref[m_rows] = np.where(np.isfinite(cur_ref), ema, matched_int)
 
             for mi, (row, col) in enumerate(zip(m_rows, m_cols)):
                 _hist_pos[row].append(md[mi].copy())
@@ -571,6 +625,7 @@ def _track_detections(
             elev_axis=opts.elev_axis,
             elev_meas_factor=opts.elev_meas_factor,
             elev_gate_factor=opts.elev_gate_factor,
+            intensity_cost_weight=opts.intensity_cost_weight,
         )
     active: list[dict] = []
     done: list[dict] = []
