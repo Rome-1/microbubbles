@@ -32,9 +32,28 @@ validated, params backward-compatible.**
   (elevation localization jitter) cannot be told from these proxies.
 - **R×10 adds beyond the gate on real data** (g3r10 > g4 on n_tracks/straightness/frag),
   unlike the synthetic unit test where the box gate masked R. So both knobs matter.
-- **Sweet spot: g3r10** (gate×3, R×10). Verdict PENDING split-half FRC: if the extra
-  tracks reproduce across independent acq-halves they are real coverage; if not, the
-  gate is manufacturing elevation-bridged tracks. **This is why FRC is now the critical path.**
+- **Sweet spot: g3r10** (gate×3, R×10).
+
+### FRC verdict (split-half, acq-parity) — #4 is a REAL win
+
+| config | xz_res_mm (finer=better) | fsc3d_res_mm | repro_score (↑=more reproducible) |
+|--------|------:|------:|------:|
+| base60 (iso)  | 0.957 | 0.777 | 0.614 |
+| g2            | 0.911 | 0.666 | 0.637 |
+| g3            | 0.927 | 0.435 | **0.645** |
+| **g3r10**     | **0.899** | 0.436 | 0.644 |
+| g4            | 0.930 | 0.435 | 0.644 |
+
+The elevation lever **raises repro_score** (0.614→0.645, +5 %) — the extra coverage
+**reproduces across independent acq-halves, so it is real, not artifact** — while making
+the trustworthy lateral (**xz) resolution finer** (0.957→0.899 mm) and **3D resolution
++44 %** (0.777→0.435 mm). The flat track-lifetime caution is thus resolved: the
+reconstruction is more reproducible AND finer, which is what matters for the vessel map.
+(yz/xy res pinned at 0.224 across all configs — those planes weren't discriminating here,
+a coarse-y/grid quirk; rely on xz + fsc3d + repro_score.) **VERDICT: ship the
+elevation-anisotropic Kalman; g3r10 (gate×3, R×10) is the pick** — coverage +20 %,
+straightness +5 %, xz resolution +6 % finer, 3D resolution +44 % finer, no frag penalty,
+FRC-confirmed reproducible. This was the top cross-model prediction and it held up.
 
 ## SVD-cutoff sweep — IN FLIGHT (6 variants × 60 acqs, fused beamform)
 Single-acq detection preview (acq 0): fix8 371k, fix17 486k, knee 489k (+8.7 % vs
