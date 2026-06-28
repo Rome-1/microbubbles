@@ -1213,7 +1213,8 @@ def track_acqs(tag: str = "baseline", min_track_length: int = 5,
 def retrack(baseline_tag: str = "baseline", out_tag: str = "kalman_pred",
             gate_on_prediction: bool = True, min_track_length: int = 5,
             elev_meas_factor: float = 1.0, elev_gate_factor: float = 1.0,
-            elev_axis: int = 1) -> dict:
+            elev_axis: int = 1, intensity_cost_weight: float = 0.0,
+            max_gap: int = 0) -> dict:
     import sys
     from pathlib import Path
 
@@ -1238,12 +1239,13 @@ def retrack(baseline_tag: str = "baseline", out_tag: str = "kalman_pred",
         tracks_path=Path(f"{DATA_ROOT}/tracks/{out_tag}/tracks.pkl"),
         tracking=p.get("tracking_method", "kalman"),
         max_dist=tuple(float(v) for v in md) if md else None,
-        frame_rate_hz=p.get("frame_rate_hz"), max_gap=int(p.get("max_gap", 3)),
+        frame_rate_hz=p.get("frame_rate_hz"),
+        max_gap=int(max_gap) if int(max_gap) > 0 else int(p.get("max_gap", 3)),
         min_track_length=min_track_length, reversal_penalty=10.0,
         max_cost=float(p.get("max_cost", 10.0)), gate_on_prediction=gate_on_prediction,
         smooth_sigma=2.0, smooth_method="gaussian", export_min_lengths=(5, 20, 50),
         elev_axis=int(elev_axis), elev_meas_factor=float(elev_meas_factor),
-        elev_gate_factor=float(elev_gate_factor),
+        elev_gate_factor=float(elev_gate_factor), intensity_cost_weight=float(intensity_cost_weight),
     )
     out_dir = Path(_guard(f"{DATA_ROOT}/tracks/{out_tag}"))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1252,7 +1254,8 @@ def retrack(baseline_tag: str = "baseline", out_tag: str = "kalman_pred",
     out["tracks"] = tracks
     out.setdefault("params", {})
     out["params"] = {**p, "retrack_from": baseline_tag, "gate_on_prediction": gate_on_prediction,
-                     "elev_meas_factor": float(elev_meas_factor), "elev_gate_factor": float(elev_gate_factor)}
+                     "elev_meas_factor": float(elev_meas_factor), "elev_gate_factor": float(elev_gate_factor),
+                     "intensity_cost_weight": float(intensity_cost_weight), "max_gap": int(opts.max_gap)}
     dump_pickle(out, opts.tracks_path)
     smoothed = smooth_tracks_pickle(opts.tracks_path, None, sigma=2.0, method="gaussian")
     for ml in (5, 20, 50):
