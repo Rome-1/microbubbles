@@ -65,11 +65,23 @@ FRC-confirmed reproducible. This was the top cross-model prediction and it held 
 | +gpred +intensity3                 | 0.903 | 0.730 | 0.636 | 52598 |
 | **+gpred +intensity3 +max_gap6**   | **0.870** | **0.435** | **0.655** | 59112 |
 
-Full stack `gp_i3_g6` is best on all three primary metrics (repro 0.655 = **+6.6 % vs base**,
-xz **+9 % finer**, fsc3d **+44 % finer**), but the path is **non-monotonic**: intensity-3
-*alone* (with gpred) hurt (fsc3d 0.73), max_gap=6 recovered it — so max_gap may be the real
-secondary lever, intensity a wash. Running isolations (g3r10+gap6; g3r10+gpred+gap6) to
-attribute. **Robust headline unchanged: elevation Kalman is the big win; the rest is marginal.**
+**Clean attribution (isolation retracks):**
+
+| config | xz_res_mm | fsc3d_res_mm | repro_score |
+|--------|------:|------:|------:|
+| base60 (iso)              | 0.955 | 0.777 | 0.615 |
+| g3r10 (elev only)         | 0.890 | 0.436 | 0.645 |
+| **g3r10 + max_gap6**      | **0.839** | **0.397** | **0.672** |
+| g3r10 + gpred + gap6      | 0.852 | 0.431 | 0.660 |
+| g3r10 + gpred + int3 + gap6 | 0.868 | 0.435 | 0.655 |
+
+**BEST TRACKING = elevation-anisotropic Kalman (g3r10) + max_gap=6** → repro_score 0.672
+(**+9.3 % vs base**), xz_res 0.839 (**+12 % finer**), fsc3d 0.397 (**+49 % finer**). max_gap=6
+is a real secondary lever (#8, +4 % repro over g3r10 alone). **gate_on_prediction and
+intensity cost (#9) both *hurt* on top** — coherent: once elevation is down-weighted,
+extrapolating the unreliable elevation *velocity* (gpred) propagates noise, so a wide
+elevation gate with NO prediction wins. The earlier `gp_i3_g6` "best" was a non-monotonic
+artifact. → Composite uses **g3r10 + max_gap6, gpred off, intensity off**.
 
 ## SVD-cutoff sweep — IN FLIGHT (6 variants × 60 acqs, fused beamform)
 Single-acq detection preview (acq 0): fix8 371k, fix17 486k, knee 489k (+8.7 % vs
