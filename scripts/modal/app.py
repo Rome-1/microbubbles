@@ -1211,7 +1211,9 @@ def track_acqs(tag: str = "baseline", min_track_length: int = 5,
 # --------------------------------------------------------------------------- #
 @app.function(image=cpu_image, timeout=3600, memory=49152, volumes={"/root/data": vol})
 def retrack(baseline_tag: str = "baseline", out_tag: str = "kalman_pred",
-            gate_on_prediction: bool = True, min_track_length: int = 5) -> dict:
+            gate_on_prediction: bool = True, min_track_length: int = 5,
+            elev_meas_factor: float = 1.0, elev_gate_factor: float = 1.0,
+            elev_axis: int = 1) -> dict:
     import sys
     from pathlib import Path
 
@@ -1240,6 +1242,8 @@ def retrack(baseline_tag: str = "baseline", out_tag: str = "kalman_pred",
         min_track_length=min_track_length, reversal_penalty=10.0,
         max_cost=float(p.get("max_cost", 10.0)), gate_on_prediction=gate_on_prediction,
         smooth_sigma=2.0, smooth_method="gaussian", export_min_lengths=(5, 20, 50),
+        elev_axis=int(elev_axis), elev_meas_factor=float(elev_meas_factor),
+        elev_gate_factor=float(elev_gate_factor),
     )
     out_dir = Path(_guard(f"{DATA_ROOT}/tracks/{out_tag}"))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1247,7 +1251,8 @@ def retrack(baseline_tag: str = "baseline", out_tag: str = "kalman_pred",
     out = dict(data)
     out["tracks"] = tracks
     out.setdefault("params", {})
-    out["params"] = {**p, "retrack_from": baseline_tag, "gate_on_prediction": gate_on_prediction}
+    out["params"] = {**p, "retrack_from": baseline_tag, "gate_on_prediction": gate_on_prediction,
+                     "elev_meas_factor": float(elev_meas_factor), "elev_gate_factor": float(elev_gate_factor)}
     dump_pickle(out, opts.tracks_path)
     smoothed = smooth_tracks_pickle(opts.tracks_path, None, sigma=2.0, method="gaussian")
     for ml in (5, 20, 50):
