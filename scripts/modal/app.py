@@ -994,6 +994,167 @@ def detect_acqs(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: flo
 
 
 # --------------------------------------------------------------------------- #
+# detect_acqs_multi (Phase A, FUSED SWEEP) — GPU. Beamform each acq ONCE, then
+# apply N SVD variants to that single beamformed volume and checkpoint each to its
+# own tag. Beamform (~172s/acq) + TGC dominate cost and are IDENTICAL across SVD
+# variants, so a fused sweep is ~5x cheaper than N separate detect_acqs runs and
+# scientifically cleaner (every variant sees the exact same beamform per acq).
+# Checkpoints are named by GLOBAL order (position in the canonical selection), so
+# the work splits cleanly across GPUs by acq range without filename collisions.
+# --------------------------------------------------------------------------- #
+@app.function(image=gpu_image, gpu="A10G", timeout=12 * 3600, memory=98304,
+              volumes={"/root/data": vol})
+def detect_acqs_multi(variants: str, url: str = SAMPLE_URL, elev_planes: int = 25,
+                      frame_rate_hz: float = 222.0, spatial_tgc: bool = True, tgc_acqs: int = 12,
+                      tgc_sigma_lambda: float = 9.0, tgc_svd_cut: float = 0.05,
+                      acq_start: int = 0, num_acqs: int = 0, acq_step: int = 1,
+                      tgc_from_tag: str = "base60", detector: str = "zscore") -> dict:
+    """variants: JSON list of dicts, each {tag, svd_method, svd_low_cutoff?, knee_high?}.
+    acq_start/num_acqs index the CANONICAL selection all_ids[::acq_step] globally, so
+    different (acq_start, num_acqs) chunks cover disjoint acqs with stable order ids."""
+    import json
+    import os
+    import sys
+    import time
+    from pathlib import Path
+
+    import h5py
+    import numpy as np
+
+    sys.path.insert(0, "/workspace")
+    from ultratrace_ulm.beamform_core import beamform_iq
+    from ultratrace_ulm.gpu_detect import detect_batch_gpu
+    from ultratrace_ulm.gpu_svd import filter_svd_3d_gpu, filtered_magnitude_gpu
+    from ultratrace_ulm.tracking import TrackingOptions, _grid_spacing, detect_localize_acq
+
+    _ensure_root()
+    specs = json.loads(variants)
+    if not isinstance(specs, list) or not specs:
+        raise ValueError("variants must be a non-empty JSON list of {tag, svd_method, ...}")
+    for s in specs:
+        s.setdefault("svd_low_cutoff", 0.1)
+        s.setdefault("knee_high", False)
+        s["det_dir"] = _guard(f"{DATA_ROOT}/detections/{s['tag']}")
+        os.makedirs(s["det_dir"], exist_ok=True)
+
+    h5, fobj, source = _open_local_or_remote_h5(url)
+    print(f"[multi] source={source} variants={[s['tag'] for s in specs]}", flush=True)
+    all_ids = sorted(int(k) for k in h5["acquisitions"].keys() if str(k).isdigit())
+    canonical = all_ids[::acq_step]
+    end = len(canonical) if not num_acqs or num_acqs <= 0 else min(len(canonical), acq_start + num_acqs)
+    chunk = list(enumerate(canonical))[acq_start:end]  # (global_order, aid)
+    config = _build_config(h5, elev_planes)
+
+    def _read(aid):
+        g = h5[f"acquisitions/{aid}"]
+        return (np.asarray(g["iq_frames"], dtype=np.complex64),
+                np.asarray(g["tx_delays"], dtype=np.float64),
+                np.asarray(g["tx_delays_elev"], dtype=np.float64))
+
+    def _make_filter(method, low, khigh):
+        def f(comp, o):
+            return filtered_magnitude_gpu(comp, low_cutoff=float(low), method=str(method),
+                                          frame_rate_hz=o.frame_rate_hz, tissue_freq_hz=o.tissue_freq_hz,
+                                          knee_high=bool(khigh))
+        return f
+
+    def detect_fn(magnitude, sigma_threshold, min_distance, smoothing_sigma):
+        return detect_batch_gpu(magnitude, sigma_threshold, min_distance, smoothing_sigma)
+
+    opts = TrackingOptions(
+        beamformed_path=Path(f"{DATA_ROOT}/none"), tracks_path=Path(specs[0]["det_dir"]) / "x.pkl",
+        svd_method="knee", knee_filter=True, tissue_freq_hz=100.0, temporal_sigma=0.0,
+        filter_method="svd", svd_low_cutoff=0.1, sigma_threshold=2.0, min_distance=2,
+        smoothing_sigma=1.0, subpixel="centroid", window_size=5, tracking="kalman",
+        frame_rate_hz=frame_rate_hz)
+
+    # TGC: reuse a prior tag's cached inv_sqrt if available (the normalization is
+    # independent of the SVD variant), else compute once and cache to every tag.
+    inv_sqrt = None
+    if spatial_tgc:
+        shared = os.path.join(_guard(f"{DATA_ROOT}/detections/{tgc_from_tag}"), "inv_sqrt.npy") if tgc_from_tag else ""
+        if shared and os.path.exists(shared):
+            inv_sqrt = np.load(shared)
+            print(f"[tgc] reused inv_sqrt from tag '{tgc_from_tag}'", flush=True)
+        else:
+            from scipy.ndimage import gaussian_filter
+            idx = np.unique(np.linspace(0, len(canonical) - 1, min(tgc_acqs, len(canonical))).round().astype(int))
+            pd_sum, ref_grid = None, None
+            for aid in [canonical[i] for i in idx]:
+                iq, txd, txde = _read(aid)
+                comp, ref_grid = beamform_iq(iq, txd, txde, config, stream_accumulate=True)
+                out = filter_svd_3d_gpu(comp, low_cutoff=tgc_svd_cut, method="fast")
+                pd = (np.abs(out) ** 2).mean(0)
+                pd_sum = pd if pd_sum is None else pd_sum + pd
+            pd_mean = pd_sum / len(idx)
+            z_ax, y_ax, x_ax = ref_grid.z[:, 0, 0], ref_grid.y[0, :, 0], ref_grid.x[0, 0, :]
+            sm = tgc_sigma_lambda * (1540.0 / config.tx_freq_hz)
+            dz = abs(z_ax[1] - z_ax[0]) if len(z_ax) > 1 else None
+            dx = abs(x_ax[1] - x_ax[0]) if len(x_ax) > 1 else None
+            dy = abs(y_ax[1] - y_ax[0]) if len(y_ax) > 1 else None
+            sig = (sm / dy if (dy and dy > 0) else 0.0, sm / dz if dz else 0.0, sm / dx if dx else 0.0)
+            tgc = gaussian_filter(pd_mean, sigma=sig).astype(np.float32)
+            inv_sqrt = (1.0 / np.sqrt(np.maximum(tgc, np.finfo(np.float32).eps)))[None]
+
+    # Per-variant meta.json (written once per tag).
+    spacing_written = False
+
+    counts = {s["tag"]: 0 for s in specs}
+    timings = []
+    try:
+        for order, aid in chunk:
+            todo = [s for s in specs if not os.path.exists(os.path.join(s["det_dir"], f"acq_{order:04d}.npz"))]
+            if not todo:
+                continue
+            t0 = time.time(); iq, txd, txde = _read(aid); t_read = time.time() - t0
+            t0 = time.time()
+            comp, grid = beamform_iq(iq, txd, txde, config, stream_accumulate=True)
+            if inv_sqrt is not None:
+                comp = (comp * inv_sqrt).astype(np.complex64)
+            t_bf = time.time() - t0
+            gx = (np.transpose(grid.x, (1, 0, 2)) * 1000.0).astype(np.float32)
+            gy = (np.transpose(grid.y, (1, 0, 2)) * 1000.0).astype(np.float32)
+            gz = (np.transpose(grid.z, (1, 0, 2)) * 1000.0).astype(np.float32)
+            spacing = _grid_spacing(gx, gy, gz)
+            t_var = []
+            for s in todo:
+                tv = time.time()
+                d = detect_localize_acq(comp, gx, gy, gz, opts,
+                                        filter_fn=_make_filter(s["svd_method"], s["svd_low_cutoff"], s["knee_high"]),
+                                        detect_fn=detect_fn)
+                meta_path = os.path.join(s["det_dir"], "meta.json")
+                if not os.path.exists(meta_path):
+                    with open(meta_path, "w") as fh:
+                        json.dump({"spacing": spacing, "frames_per_acq": int(d["n_frames"]),
+                                   "frame_rate_hz": frame_rate_hz, "motion": False,
+                                   "filter_variant": "global", "svd_method": s["svd_method"],
+                                   "svd_low_cutoff": float(s["svd_low_cutoff"]),
+                                   "knee_high": bool(s["knee_high"]), "detector": detector}, fh)
+                out_npz = os.path.join(s["det_dir"], f"acq_{order:04d}.npz")
+                tmp = out_npz + ".tmp"
+                with open(tmp, "wb") as fh:
+                    np.savez(fh, positions_mm=d["positions_mm"], intensities=d["intensities"],
+                             frame_in_acq=d["frame_in_acq"], n_frames=d["n_frames"], src_acq_id=int(aid))
+                os.replace(tmp, out_npz)
+                counts[s["tag"]] += 1
+                t_var.append((s["tag"], len(d["positions_mm"]), round(time.time() - tv, 1)))
+            vol.commit()
+            timings.append([round(t_read, 1), round(t_bf, 1)])
+            print(f"[multi] order={order} acq={aid} read={t_read:.1f}s beamform={t_bf:.1f}s "
+                  f"variants={t_var}", flush=True)
+    finally:
+        h5.close()
+        if fobj is not None:
+            fobj.close()
+    tarr = np.array(timings) if timings else np.zeros((1, 2))
+    report = {"source": source, "chunk": [acq_start, end], "processed": len(timings),
+              "per_variant_new": counts,
+              "median_s": {"read": float(np.median(tarr[:, 0])), "beamform": float(np.median(tarr[:, 1]))}}
+    print(json.dumps(report, indent=2))
+    return report
+
+
+# --------------------------------------------------------------------------- #
 # track_acqs (Phase B) — CPU, cheap. Track from ALL per-acq detection
 # checkpoints for a tag (additive: re-run after adding more acqs). Produces the
 # same tracks/bins as the fused baseline, but the expensive part can never be
@@ -1302,7 +1463,7 @@ def main(fn: str = "inspect"):
         "beamform_all": beamform_all, "consolidate": consolidate, "track": track,
         "baseline": baseline, "validate_svd": validate_svd, "volume3d": volume3d,
         "retrack": retrack, "detect_acqs": detect_acqs, "track_acqs": track_acqs,
-        "stitch": stitch,
+        "detect_acqs_multi": detect_acqs_multi, "stitch": stitch,
     }
     if fn not in table:
         raise SystemExit(f"unknown fn {fn!r}; choose from {sorted(table)}")
