@@ -64,7 +64,8 @@ def stitch_tracks(
     tol_elev_mm: float = 1.0,  # Codex cross-check: 2.0mm (~3 elev planes) false-merged
     # distinct elevation-separated bubbles. 1.0mm (~2 planes) allows real jitter,
     # rejects distinct ones. Final value swept in the bake-off (split-half arbiter).
-    vel_cos_min: float = 0.3,
+    vel_cos_min: float = 0.8,  # lit-grounded (docs/literature): 0.3 over-merged
+    # (straightness 0.88->0.55); >=0.8 default, 0.7 permissive edge, avoid 0.3.
     intensity_log_tol: float = 1.5,
     max_cost: float = 1.0,
 ) -> list[dict]:
