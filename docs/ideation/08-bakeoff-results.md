@@ -55,6 +55,22 @@ elevation-anisotropic Kalman; g3r10 (gate×3, R×10) is the pick** — coverage 
 straightness +5 %, xz resolution +6 % finer, 3D resolution +44 % finer, no frag penalty,
 FRC-confirmed reproducible. This was the top cross-model prediction and it held up.
 
+### Combined tracking stack (retrack base60, FRC) — building on g3r10
+
+| config | xz_res_mm | fsc3d_res_mm | repro_score | n_tracks |
+|--------|------:|------:|------:|------:|
+| base60 (iso)                       | 0.957 | 0.777 | 0.614 | 49274 |
+| g3r10 (elev, gpred=off)            | 0.899 | 0.436 | 0.644 | 60638 |
+| +gpred                             | 0.874 | 0.437 | 0.639 | 54312 |
+| +gpred +intensity3                 | 0.903 | 0.730 | 0.636 | 52598 |
+| **+gpred +intensity3 +max_gap6**   | **0.870** | **0.435** | **0.655** | 59112 |
+
+Full stack `gp_i3_g6` is best on all three primary metrics (repro 0.655 = **+6.6 % vs base**,
+xz **+9 % finer**, fsc3d **+44 % finer**), but the path is **non-monotonic**: intensity-3
+*alone* (with gpred) hurt (fsc3d 0.73), max_gap=6 recovered it — so max_gap may be the real
+secondary lever, intensity a wash. Running isolations (g3r10+gap6; g3r10+gpred+gap6) to
+attribute. **Robust headline unchanged: elevation Kalman is the big win; the rest is marginal.**
+
 ## SVD-cutoff sweep — IN FLIGHT (6 variants × 60 acqs, fused beamform)
 Single-acq detection preview (acq 0): fix8 371k, fix17 486k, knee 489k (+8.7 % vs
 floor 450k), fix30 470k, fix70/floor 450k, **kneeH (knee+MP noise cut) 542k (+20 %)**.
