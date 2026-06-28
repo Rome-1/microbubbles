@@ -727,7 +727,8 @@ def detect_acqs(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: flo
                 svd_method: str = "adaptive", motion: bool = False, filter_variant: str = "global",
                 n_z_blocks: int = 3, n_x_blocks: int = 3, keep_orders: str = "", tag: str = "baseline",
                 detector: str = "zscore", svd_rank: bool = False, rank_delta: float = 2.0,
-                nms_elev: int = 0, elev_debias: bool = False, low_conf: bool = False) -> dict:
+                nms_elev: int = 0, elev_debias: bool = False, low_conf: bool = False,
+                svd_low_cutoff: float = 0.1, knee_high: bool = False) -> dict:
     import json
     import os
     import sys
@@ -799,12 +800,13 @@ def detect_acqs(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: flo
                 frame_rate_hz=o.frame_rate_hz, tissue_freq_hz=o.tissue_freq_hz,
                 n_z_blocks=n_z_blocks, n_x_blocks=n_x_blocks)
         return filtered_magnitude_gpu(comp, low_cutoff=o.svd_low_cutoff, method=o.svd_method,
-                                      frame_rate_hz=o.frame_rate_hz, tissue_freq_hz=o.tissue_freq_hz)
+                                      frame_rate_hz=o.frame_rate_hz, tissue_freq_hz=o.tissue_freq_hz,
+                                      knee_high=bool(knee_high))
 
     opts = TrackingOptions(
         beamformed_path=Path(f"{DATA_ROOT}/none"), tracks_path=Path(det_dir) / "x.pkl",
         svd_method=svd_method, knee_filter=True, tissue_freq_hz=100.0, temporal_sigma=0.0,
-        filter_method="svd", svd_low_cutoff=0.1, sigma_threshold=2.0, min_distance=2,
+        filter_method="svd", svd_low_cutoff=svd_low_cutoff, sigma_threshold=2.0, min_distance=2,
         smoothing_sigma=1.0, subpixel="centroid", window_size=5, tracking="kalman",
         frame_rate_hz=frame_rate_hz)
 
@@ -932,7 +934,8 @@ def detect_acqs(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: flo
             if not os.path.exists(os.path.join(det_dir, "meta.json")):
                 meta = {"spacing": _grid_spacing(gx, gy, gz), "frames_per_acq": int(d["n_frames"]),
                         "frame_rate_hz": frame_rate_hz, "motion": motion,
-                        "filter_variant": filter_variant, "svd_method": svd_method}
+                        "filter_variant": filter_variant, "svd_method": svd_method,
+                        "svd_low_cutoff": float(svd_low_cutoff), "knee_high": bool(knee_high)}
                 if (
                     detector != "zscore" or use_svd_rank or int(nms_elev) > 0
                     or bool(elev_debias) or bool(low_conf)
