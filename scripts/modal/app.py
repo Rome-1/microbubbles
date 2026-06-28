@@ -726,7 +726,7 @@ def detect_acqs(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: flo
                 tgc_svd_cut: float = 0.05, acq_start: int = 0, num_acqs: int = 0, acq_step: int = 1,
                 svd_method: str = "adaptive", motion: bool = False, filter_variant: str = "global",
                 n_z_blocks: int = 3, n_x_blocks: int = 3, keep_orders: str = "", tag: str = "baseline",
-                detector: str = "zscore", svd_rank: bool | str = False, rank_delta: float = 2.0,
+                detector: str = "zscore", svd_rank: bool = False, rank_delta: float = 2.0,
                 nms_elev: int = 0, elev_debias: bool = False, low_conf: bool = False) -> dict:
     import json
     import os
