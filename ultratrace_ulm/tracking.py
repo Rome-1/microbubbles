@@ -48,6 +48,13 @@ class TrackingOptions:
     reversal_penalty: float = 10.0
     max_cost: float = 10.0
     gate_on_prediction: bool = False  # mb-crr.10: gate on Kalman-predicted pos, not last-observed
+    # mb-crr: elevation-anisotropic Kalman. Our 25 elevation planes are synthesized
+    # from ONE physical receive row, so the y (elevation) axis is far less reliable
+    # than x/z (dy~3.8x coarser). Down-weight elevation in the filter and widen its
+    # gate. Defaults (axis 1, factors 1.0) reproduce isotropic behavior exactly.
+    elev_axis: int = 1  # which coordinate is elevation (x,y,z) -> y is index 1
+    elev_meas_factor: float = 1.0  # multiply R[elev,elev] (>1 => smaller Kalman gain in y)
+    elev_gate_factor: float = 1.0  # multiply the box-gate half-width along elevation
     smooth_sigma: float = 2.0
     smooth_method: str = "gaussian"
     smooth_window: int = 5
@@ -231,6 +238,9 @@ def kalman_tracking_3d(
     max_cost: float = 1e5,
     intensities: List[np.ndarray] = None,
     gate_on_prediction: bool = False,
+    elev_axis: int = 1,
+    elev_meas_factor: float = 1.0,
+    elev_gate_factor: float = 1.0,
 ) -> List[Dict]:
     """
     Track bubbles in 3D using Kalman filter + Hungarian assignment.
@@ -248,18 +258,36 @@ def kalman_tracking_3d(
                  rejected even if Hungarian assigns them. Lower values make the
                  reversal penalty actually cause rejection (default: 1e5).
         intensities: Optional list of (N_i,) arrays, one per frame, with detection intensities
+        elev_axis: Index (0=x, 1=y, 2=z) of the elevation coordinate. y (1) by default.
+        elev_meas_factor: Multiplier on the measurement-noise variance R[elev,elev].
+                         >1 inflates elevation measurement noise, shrinking the Kalman
+                         gain in that axis so the filter trusts its prediction more and
+                         keeps a larger elevation covariance (the Mahalanobis cost then
+                         tolerates larger elevation deviations). 1.0 = isotropic (default).
+        elev_gate_factor: Multiplier on the hard box-gate half-width along elevation.
+                         >1 widens the elevation gate so larger elevation jumps reach the
+                         Mahalanobis stage. 1.0 = isotropic (default).
 
     Returns:
         List of track dicts with 'positions', 'frames', 'length' (and 'intensities' if provided)
     """
+    if elev_axis not in (0, 1, 2):
+        raise ValueError(f"elev_axis must be 0, 1, or 2 (got {elev_axis})")
     has_intensities = intensities is not None
-    max_dist_mm = np.array(max_distance_mm)
+    max_dist_mm = np.array(max_distance_mm, dtype=float)
+    # mb-crr: widen the hard box gate along elevation (default factor 1.0 = unchanged).
+    max_dist_mm = max_dist_mm.copy()
+    max_dist_mm[elev_axis] *= elev_gate_factor
     tracks = []
     track_id_counter = 0
 
     # Pre-compute shared Kalman matrices
     Q_template = np.diag([process_noise] * 3 + [process_noise * 2] * 3)
-    R_template = np.eye(3) * measurement_noise
+    # mb-crr: anisotropic measurement noise -- inflate R along elevation so the
+    # Kalman gain in y is smaller (default factor 1.0 reproduces np.eye(3)*noise).
+    R_diag = np.full(3, measurement_noise, dtype=float)
+    R_diag[elev_axis] *= elev_meas_factor
+    R_template = np.diag(R_diag)
     P_init = np.eye(6) * 100.0
     H = np.array(
         [[1, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0], [0, 0, 1, 0, 0, 0]], dtype=float
@@ -540,6 +568,9 @@ def _track_detections(
             max_cost=opts.max_cost,
             intensities=intensities,
             gate_on_prediction=opts.gate_on_prediction,
+            elev_axis=opts.elev_axis,
+            elev_meas_factor=opts.elev_meas_factor,
+            elev_gate_factor=opts.elev_gate_factor,
         )
     active: list[dict] = []
     done: list[dict] = []
