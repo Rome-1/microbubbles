@@ -50,9 +50,17 @@ def filter_svd_3d_gpu(
     frame_rate_hz: float | None = None,
     tissue_freq_hz: float = 100.0,
     voxel_chunk: int = 300_000,
+    knee_min: int = 1,
+    knee_high: bool = False,
 ) -> np.ndarray:
-    """GPU fast/adaptive temporal-SVD clutter filter. Returns the filtered
-    complex volume on the host, same shape as ``data`` ((F,elev,z,x) or (F,z,x))."""
+    """GPU fast/adaptive/knee temporal-SVD clutter filter. Returns the filtered
+    complex volume on the host, same shape as ``data`` ((F,elev,z,x) or (F,z,x)).
+
+    ``method='knee'`` selects the low (tissue) cutoff data-drivenly from the
+    singular-value curve (``svd_knee.singular_value_knee``) instead of the fixed
+    fraction, with ``low_cutoff`` reinterpreted as the *ceiling* (e.g. 0.1 -> at
+    most 10 % of frames). ``knee_high`` additionally enables the Marchenko-Pastur
+    high-order noise cutoff. See ``svd_knee`` for the rationale (mb-3k4)."""
     import cupy as cp
 
     if data.ndim == 3:
@@ -96,6 +104,8 @@ def filter_svd_3d_gpu(
             raise ValueError("method='adaptive' requires frame_rate_hz")
         low = _spectral_centroid_cutoff_gpu(Gc, n_frames, frame_rate_hz, tissue_freq_hz)
         del Gc
+    elif method == "knee":
+        low = None  # data-driven; resolved from G's eigenvalues below
     elif method in {"fast", "full", "gpu", "gpu_full", "randomized"}:
         low = int(n_components) if n_components is not None else _component_count(low_cutoff, n_frames)
     elif method == "none":
@@ -105,10 +115,21 @@ def filter_svd_3d_gpu(
 
     high = 1.0 if high_cutoff is None else float(high_cutoff)
     high_remove = max(0, min(n_frames, int(round((1.0 - high) * n_frames))))
+
+    evals, u = cp.linalg.eigh(G)   # complex128
+    if method == "knee":
+        from .svd_knee import select_svd_cutoffs
+
+        ceiling = int(n_components) if n_components is not None else _component_count(low_cutoff, n_frames)
+        low, knee_high_remove = select_svd_cutoffs(
+            cp.asnumpy(evals.real), n_frames, n_vox,
+            low_min=int(knee_min), low_max=ceiling, high=bool(knee_high),
+        )
+        high_remove = max(high_remove, knee_high_remove)
+
     if low + high_remove >= n_frames:
         raise ValueError(f"SVD cutoff removes all components: low={low}, high={high_cutoff}")
 
-    evals, u = cp.linalg.eigh(G)   # complex128
     u = u[:, cp.argsort(evals)[::-1]]
     stop = n_frames - high_remove if high_remove > 0 else n_frames
     uc = u[:, low:stop].astype(cp.complex64)  # (F, k); project in complex64
@@ -136,12 +157,15 @@ def filtered_magnitude_gpu(
     frame_rate_hz: float | None = None,
     tissue_freq_hz: float = 100.0,
     voxel_chunk: int = 300_000,
+    knee_min: int = 1,
+    knee_high: bool = False,
 ) -> np.ndarray:
     """GPU analogue of ``svd.filtered_magnitude``."""
     filtered = filter_svd_3d_gpu(
         compound, low_cutoff=low_cutoff, high_cutoff=high_cutoff, method=method,
         n_components=n_components, frame_rate_hz=frame_rate_hz,
         tissue_freq_hz=tissue_freq_hz, voxel_chunk=voxel_chunk,
+        knee_min=knee_min, knee_high=knee_high,
     )
     magnitude = np.abs(filtered).astype(np.float32, copy=False)
     if temporal_sigma > 0:

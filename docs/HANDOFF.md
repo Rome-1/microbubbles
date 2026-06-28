@@ -80,12 +80,23 @@ Codex=detection/SVD; both cross-checked each other (Codex found + Opus fixed a r
 - Literature deep-dives running → `docs/literature/lit-detection-svd.md`, `lit-tracking-eval.md`
   (scientific basis for the knob values).
 
+## SVD knee — BUILT (mb-3k4, see `docs/ideation/06-svd-knee.md`)
+The "SVD cutoff is the big one" lever is now built + unit-tested (CPU), bake-off-ready,
+**pending only Rome's Modal-spend OK**. Confirmed empirically: the `adaptive` cutoff is a
+**constant 70-mode cut** on our data — at 222 Hz (Nyquist 111) no temporal mode's centroid
+ever exceeds `tissue_freq_hz=100`, so it always hits the 70 fallback. New `svd_method="knee"`
+(`ultratrace_ulm/svd_knee.py`) uses a data-driven singular-value knee (Kneedle) for the low
+cutoff with the old 10% recast as a **ceiling** (so knee ≤ 70 always = monotone coverage-safe),
++ optional MP high-order noise cutoff (`knee_high`, off by default). Wired into CPU/GPU SVD,
+`detect_acqs(svd_method="knee")`, and `validate_svd`. **Next: run the bake-off in 06-svd-knee.md.**
+
 ## Literature-grounded knob settings (next session — see `docs/literature/`)
 Two cited reviews (`lit-detection-svd.md` = full Opus deep-dive; `lit-knobs-grounding.md` = Codex summary):
 - **SVD cutoff is the big one:** ours floors to ~70 modes (10% of 700), but tissue is only a
   FEW-to-low-TENS of modes → **we over-remove → THIS is the coverage-loss cause.** Switch to a
   data-driven knee (singular-value gradient + spatial-vector correlation) + a separate high-order
   noise cutoff. Likely beats per-block rank for coverage. (Demené 2015, Baranger 2018, Lok/Song 2020.)
+  **→ DONE (low knee + MP high), see SVD knee section above + `docs/ideation/06-svd-knee.md`.**
 - **Stitch `vel_cos_min`: 0.8** (applied; was 0.3 → over-merge). 0.7 permissive edge.
 - **Detection: two-tier** — spawn at 4–6σ, continue at 3.5–4.5σ (FN costs ~45% SSIM vs FP ~7% → bias sensitive).
 - **Elevation: down-weight** — Kalman `R_yy` ×5–10 (test ×15–25 for our 1-row aperture), Mahalanobis gate, 2D-first.
