@@ -155,6 +155,329 @@ def mp_noise_cutoff(
     return int(max(0, n - signal_end))
 
 
+def _temporal_basis(
+    matrix: np.ndarray, *, voxel_chunk: int = 300_000
+) -> tuple[np.ndarray, np.ndarray]:
+    """Temporal singular vectors ``U`` (descending) and singular values ``s`` from
+    the **raw** Gram ``G = X Xᴴ`` of the ``(frames, voxels)`` matrix ``X``.
+
+    This matches the basis the ``filter_svd_3d`` "fast"/"knee" projection uses
+    (raw, not mean-subtracted), so the modes scored here are the modes actually
+    removed. The Gram is accumulated in voxel chunks in ``complex128`` so we never
+    materialise a full conjugate copy of the (potentially many-GB) matrix -- the
+    same memory discipline the GPU port follows.
+    """
+    x = np.asarray(matrix)
+    n_frames = int(x.shape[0])
+    n_vox = int(x.shape[1])
+    g = np.zeros((n_frames, n_frames), dtype=np.complex128)
+    if n_vox > 0:
+        step = max(1, int(voxel_chunk))
+        for c0 in range(0, n_vox, step):
+            xc = x[:, c0:c0 + step]
+            g += (xc @ xc.conj().T).astype(np.complex128)
+    evals, u = np.linalg.eigh(g)
+    order = np.argsort(evals)[::-1]
+    u = u[:, order]
+    s = np.sqrt(np.maximum(evals[order].real, 0.0))
+    return u, s
+
+
+def _neighbor_coherence(
+    rows: np.ndarray, spatial_shape: tuple[int, ...]
+) -> np.ndarray | None:
+    """Normalised lag-1 spatial autocorrelation of each spatial singular vector.
+
+    ``rows`` is ``(n_modes, n_voxels)`` -- one (possibly conjugated/scaled)
+    spatial singular vector per row. Each row is reshaped to ``spatial_shape`` and
+    the metric, for every spatial axis ``a`` with length >= 2, is the
+    phase-invariant normalised inner product between the field and its one-voxel
+    shift along ``a``::
+
+        rho_a = |Σ conj(v_k)·v_{k+1}| / sqrt(Σ|v_k|² · Σ|v_{k+1}|²)   ∈ [0, 1]
+
+    averaged over the available axes. It is a *cosine similarity* between adjacent
+    voxels, not a mean-centred Pearson correlation: the non-centred form is stable
+    for near-constant (DC-like) tissue modes (a constant field -> 1) and avoids the
+    division blow-up a centred form suffers when the spatial mean dominates. It is
+    invariant to the singular vector's arbitrary global phase and to its scale, so
+    ``V_i ∝ Xᴴ U_i`` may be used directly (no need to divide by ``s_i``, which is
+    ill-conditioned for the near-zero high-order modes).
+
+    A smooth, low-spatial-frequency *tissue* mode has adjacent voxels nearly equal
+    -> rho ~ 1; a spatially incoherent *blood/noise* mode has adjacent voxels
+    decorrelated -> rho ~ 1/sqrt(pairs) ~ 0. Returns ``None`` if no spatial axis
+    has length >= 2 (coherence is undefined).
+    """
+    n_modes = int(rows.shape[0])
+    grid = rows.reshape((n_modes,) + tuple(int(d) for d in spatial_shape))
+    ndim = len(spatial_shape)
+    reduce_axes = tuple(range(1, ndim + 1))
+    rho_sum = np.zeros(n_modes, dtype=np.float64)
+    n_axes = 0
+    for ax in range(ndim):
+        axis = ax + 1
+        if grid.shape[axis] < 2:
+            continue
+        sl_a = [slice(None)] * (ndim + 1)
+        sl_b = [slice(None)] * (ndim + 1)
+        sl_a[axis] = slice(0, -1)
+        sl_b[axis] = slice(1, None)
+        a = grid[tuple(sl_a)]
+        b = grid[tuple(sl_b)]
+        num = np.abs(np.sum(np.conj(a) * b, axis=reduce_axes))
+        denom = np.sqrt(
+            np.sum(np.abs(a) ** 2, axis=reduce_axes)
+            * np.sum(np.abs(b) ** 2, axis=reduce_axes)
+        )
+        rho_sum += np.where(denom > 0, num / np.where(denom > 0, denom, 1.0), 0.0)
+        n_axes += 1
+    if n_axes == 0:
+        return None
+    return rho_sum / n_axes
+
+
+def _collapse_index(
+    coherence: np.ndarray,
+    min_allowed: int,
+    max_allowed: int,
+    rel_threshold: float,
+) -> int:
+    """Index of the first collapse of a per-mode spatial-coherence curve.
+
+    The leading (tissue) modes are spatially coherent; the curve falls off where
+    the subspace turns to blood/noise. We locate the **first** crossing of a level
+    set between a robust high reference (``max`` over the candidate window) and a
+    robust floor (10th percentile over the evaluated modes)::
+
+        threshold = floor + rel_threshold · (reference - floor)
+
+    The returned cutoff is the first mode index whose coherence drops below
+    ``threshold`` (clamped to ``[min_allowed, max_allowed]``). If coherence never
+    drops within the window the tissue subspace extends past the ceiling ->
+    ``max_allowed``. If there is **no contrast** (a flat curve: all-tissue or
+    all-noise, no separable boundary) we cannot localise a boundary and fall back
+    to the conservative ``min_allowed`` -- documented behaviour, important for the
+    soft 5-angle regime where the collapse can be shallow.
+    """
+    coh = np.asarray(coherence, dtype=np.float64)
+    m = coh.size
+    if m == 0 or not np.any(np.isfinite(coh)):
+        return min_allowed
+    hi = min(m, max_allowed + 1)
+    reference = float(np.max(coh[:hi]))
+    floor = float(np.percentile(coh, 10))
+    contrast = reference - floor
+    if not np.isfinite(contrast) or contrast <= max(1e-6, 0.05 * abs(reference)):
+        return min_allowed
+    threshold = floor + float(rel_threshold) * contrast
+    below = np.where(coh[:hi] < threshold)[0]
+    cut = int(below[0]) if below.size else max_allowed
+    return int(np.clip(cut, min_allowed, max_allowed))
+
+
+def spatial_correlation_cutoff(
+    matrix: np.ndarray,
+    spatial_shape: tuple[int, ...] | None = None,
+    *,
+    u: np.ndarray | None = None,
+    s: np.ndarray | None = None,
+    min_rank: int = 1,
+    max_rank: int | None = None,
+    rel_threshold: float = 0.5,
+    smooth: int = 0,
+    n_eval: int | None = None,
+    mode_chunk: int = 16,
+    voxel_chunk: int = 300_000,
+) -> int:
+    """B18 spatial-singular-vector cutoff for the LOW (tissue) boundary.
+
+    Baranger 2018 (B18) found the most robust automatic tissue/blood cutoff is
+    based on the **spatial** singular vectors, not the singular values: low-order
+    (tissue) modes are spatially smooth/coherent across the field while blood and
+    noise modes are not, so the cutoff is the index where spatial coherence
+    *collapses*. This implements that idea with a per-mode normalised lag-1 spatial
+    autocorrelation (see ``_neighbor_coherence``) and a first-collapse rule (see
+    ``_collapse_index``).
+
+    The spatial singular vectors come from ``V_i = Xᴴ U_i / s_i`` where ``U`` are
+    the temporal singular vectors of the **raw** Gram ``G = X Xᴴ`` (so the basis
+    matches the projection ``filter_svd_3d`` actually applies) and ``s`` the
+    singular values. Because the coherence metric is invariant to each vector's
+    global phase and scale, we score ``Xᴴ U_i`` directly and never divide by the
+    ill-conditioned small ``s_i`` of the high-order modes.
+
+    Parameters
+    ----------
+    matrix : ``(frames, voxels)`` complex array, OR a ``(frames, *spatial)``
+        volume (then ``spatial_shape`` is inferred and the trailing axes flattened).
+        Always required -- the spatial vectors are ``Xᴴ U``.
+    spatial_shape : the voxel grid, required when ``matrix`` is 2-D so the flat
+        voxel axis can be reshaped for the neighbour metric.
+    u, s : optionally precomputed temporal basis (descending, as produced by
+        ``u[:, argsort(evals)[::-1]]``); pass these to avoid recomputing the Gram
+        eigendecomposition when the pipeline already has it. ``matrix`` is still
+        required (for ``Xᴴ U``); ``s`` is used only to skip null-space modes.
+    min_rank, max_rank : the same guards as :func:`singular_value_knee` -- a floor
+        that guarantees the dominant tissue mode is removed and a literature
+        ceiling (e.g. 10 % of frames) guarding a degenerate pick on a soft spectrum.
+    rel_threshold : level-set fraction between the coherence floor and reference
+        at which the collapse is declared (0.5 = halfway). Lower -> fewer modes
+        called tissue.
+    n_eval : number of leading modes to score (default a few × ``max_rank``,
+        enough to see the collapse and estimate the floor). Capped at the numeric
+        rank (``s > 0``) and the frame count.
+    mode_chunk, voxel_chunk : memory knobs -- modes are scored ``mode_chunk`` at a
+        time (each block materialises only ``(mode_chunk, voxels)``), and the Gram,
+        when computed here, is accumulated ``voxel_chunk`` voxels at a time.
+
+    Returns the number of leading (tissue) modes to remove, clamped to
+    ``[min_rank, max_rank]``.
+
+    ROBUSTNESS / HONESTY (our 5-angle "soft knee" regime). With only 5 transmit
+    angles the tissue/blood separation in the SVD is weaker than the 16-42-angle
+    works B18/L20 validated on, so the coherence collapse can be shallow. Two
+    documented fallbacks keep this safe rather than wrong: a flat (no-contrast)
+    curve yields ``min_rank`` (minimal, conservative removal), and a curve that
+    never collapses within the window yields ``max_rank`` (the ceiling guard).
+    Prefer :func:`combined_low_cutoff` (the L20 ``min`` rule), and validate the
+    chosen rank against the split-half render proxy -- there is no ground truth.
+
+    FUTURE WORK. B18 derives a *second*, high-order (noise) threshold from the same
+    machinery -- the index where coherence collapses again from the blood regime to
+    the spatially-decorrelated noise floor. That needs the coherence curve scored
+    over the full spectrum (every mode), not just the leading ``n_eval``; it is left
+    as a follow-up so the low-cutoff lever stays isolated and cheap. The
+    Marchenko-Pastur :func:`mp_noise_cutoff` already covers the high cutoff from the
+    singular-value side.
+    """
+    x = np.asarray(matrix)
+    if x.ndim > 2:
+        if spatial_shape is None:
+            spatial_shape = tuple(int(d) for d in x.shape[1:])
+        x = x.reshape(x.shape[0], -1)
+    if x.ndim != 2:
+        raise ValueError(f"matrix must be (frames, voxels) or a volume, got ndim={x.ndim}")
+    if spatial_shape is None:
+        raise ValueError("spatial_shape is required when matrix is a 2-D (frames, voxels) array")
+    spatial_shape = tuple(int(d) for d in spatial_shape)
+    n_frames, n_vox = int(x.shape[0]), int(x.shape[1])
+    if int(np.prod(spatial_shape)) != n_vox:
+        raise ValueError(
+            f"spatial_shape {spatial_shape} (prod={int(np.prod(spatial_shape))}) "
+            f"does not match the voxel count {n_vox}"
+        )
+
+    max_allowed = int(n_frames - 1 if max_rank is None else min(int(max_rank), n_frames - 1))
+    max_allowed = max(0, max_allowed)
+    min_allowed = int(max(0, min(int(min_rank), max_allowed)))
+    if n_frames == 0 or n_vox == 0 or max_allowed <= min_allowed:
+        return min_allowed
+    # No spatial adjacency on any axis -> the coherence metric is undefined.
+    if all(d < 2 for d in spatial_shape):
+        return min_allowed
+
+    x = x.astype(np.complex64, copy=False)
+    if u is None or s is None:
+        u, s = _temporal_basis(x, voxel_chunk=voxel_chunk)
+    else:
+        u = np.asarray(u)
+        s = np.asarray(s).real.astype(np.float64)
+
+    n_modes = int(u.shape[1])
+    rank = int(np.count_nonzero(s > (float(np.max(s)) * 1e-12))) if s.size else n_modes
+    rank = max(1, min(rank, n_modes))
+    if n_eval is None:
+        n_eval = max(3 * (max_allowed + 1), 24)
+    n_eval = int(min(n_eval, rank, n_modes))
+
+    coherence = np.empty(n_eval, dtype=np.float64)
+    step = max(1, int(mode_chunk))
+    for b0 in range(0, n_eval, step):
+        b1 = min(b0 + step, n_eval)
+        ub = u[:, b0:b1].astype(np.complex64)
+        # rows = (Xᴴ U_block)ᴴ = U_blockᴴ X : (kb, voxels). Computed as small @ big
+        # so the many-GB matrix is never transposed/copied. Coherence is invariant
+        # to the global conjugation this introduces.
+        rows = ub.conj().T @ x
+        block = _neighbor_coherence(rows, spatial_shape)
+        if block is None:
+            return min_allowed
+        coherence[b0:b1] = block
+
+    if smooth and int(smooth) > 1 and coherence.size >= int(smooth):
+        k = int(smooth)
+        coherence = np.convolve(coherence, np.ones(k) / k, mode="same")
+
+    return _collapse_index(coherence, min_allowed, max_allowed, float(rel_threshold))
+
+
+def combined_low_cutoff(
+    matrix: np.ndarray,
+    spatial_shape: tuple[int, ...] | None = None,
+    *,
+    u: np.ndarray | None = None,
+    s: np.ndarray | None = None,
+    singular_values: np.ndarray | None = None,
+    min_rank: int = 1,
+    max_rank: int | None = None,
+    smooth: int = 0,
+    rel_threshold: float = 0.5,
+    n_eval: int | None = None,
+    mode_chunk: int = 16,
+    voxel_chunk: int = 300_000,
+) -> int:
+    """L20 combined LOW (tissue) cutoff: ``min(knee, spatial-correlation)``.
+
+    Lok/Song 2020 take the final tissue rank as the **minimum** of two automatic
+    estimators -- the singular-value gradient/turning point and the spatial-vector
+    correlation -- which biases toward removing *fewer* tissue modes (keeping more
+    weak blood signal), the conservative choice this pipeline wants. This composes
+    :func:`singular_value_knee` (the Kneedle turning point) with
+    :func:`spatial_correlation_cutoff` (B18), under the same ``min_rank`` /
+    ``max_rank`` guards.
+
+    The temporal basis ``(u, s)`` is computed once (from the raw Gram) and shared
+    by both estimators, so this costs a single eigendecomposition. Pass precomputed
+    ``u, s`` (and/or ``singular_values``) when the caller already has them.
+
+    Returns the combined tissue rank, clamped to ``[min_rank, max_rank]``.
+    """
+    x = np.asarray(matrix)
+    if x.ndim > 2:
+        if spatial_shape is None:
+            spatial_shape = tuple(int(d) for d in x.shape[1:])
+        x = x.reshape(x.shape[0], -1)
+    if x.ndim != 2:
+        raise ValueError(f"matrix must be (frames, voxels) or a volume, got ndim={x.ndim}")
+    n_frames = int(x.shape[0])
+
+    x = x.astype(np.complex64, copy=False)
+    if u is None or s is None:
+        u, s = _temporal_basis(x, voxel_chunk=voxel_chunk)
+
+    svals = s if singular_values is None else np.asarray(singular_values)
+    knee = singular_value_knee(svals, min_rank=min_rank, max_rank=max_rank, smooth=smooth)
+    spatial = spatial_correlation_cutoff(
+        x,
+        spatial_shape,
+        u=u,
+        s=s,
+        min_rank=min_rank,
+        max_rank=max_rank,
+        rel_threshold=rel_threshold,
+        smooth=smooth,
+        n_eval=n_eval,
+        mode_chunk=mode_chunk,
+        voxel_chunk=voxel_chunk,
+    )
+
+    max_allowed = int(n_frames - 1 if max_rank is None else min(int(max_rank), n_frames - 1))
+    max_allowed = max(0, max_allowed)
+    min_allowed = int(max(0, min(int(min_rank), max_allowed)))
+    return int(np.clip(min(int(knee), int(spatial)), min_allowed, max_allowed))
+
+
 def select_svd_cutoffs(
     eigenvalues: np.ndarray,
     n_frames: int,
