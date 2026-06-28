@@ -1162,7 +1162,10 @@ def detect_acqs_multi(variants: str, url: str = SAMPLE_URL, elev_planes: int = 2
 # --------------------------------------------------------------------------- #
 @app.function(image=cpu_image, timeout=4 * 3600, memory=49152, volumes={"/root/data": vol})
 def track_acqs(tag: str = "baseline", min_track_length: int = 5,
-               gate_on_prediction: bool = False, out_tag: str = "") -> dict:
+               gate_on_prediction: bool = False, out_tag: str = "",
+               elev_meas_factor: float = 1.0, elev_gate_factor: float = 1.0,
+               elev_axis: int = 1, intensity_cost_weight: float = 0.0,
+               max_gap: int = 3) -> dict:
     import json
     import os
     import sys
@@ -1191,10 +1194,12 @@ def track_acqs(tag: str = "baseline", min_track_length: int = 5,
     out_dir.mkdir(parents=True, exist_ok=True)
     opts = TrackingOptions(
         beamformed_path=Path(f"{DATA_ROOT}/none"), tracks_path=out_dir / "tracks.pkl",
-        tracking="kalman", frame_rate_hz=meta["frame_rate_hz"], max_gap=3,
+        tracking="kalman", frame_rate_hz=meta["frame_rate_hz"], max_gap=int(max_gap),
         min_track_length=min_track_length, reversal_penalty=10.0, max_cost=10.0,
         gate_on_prediction=gate_on_prediction, smooth_sigma=2.0, smooth_method="gaussian",
-        export_dir=out_dir, export_stem="tracks", export_min_lengths=(5, 20, 50))
+        export_dir=out_dir, export_stem="tracks", export_min_lengths=(5, 20, 50),
+        elev_axis=int(elev_axis), elev_meas_factor=float(elev_meas_factor),
+        elev_gate_factor=float(elev_gate_factor), intensity_cost_weight=float(intensity_cost_weight))
     tracks_pkl = track_from_acq_detections(per_acq, opts, meta["spacing"], opts.tracks_path,
                                            extra={"from_detections": tag, **meta})
     smoothed = _smooth_and_export(opts, tracks_pkl)
