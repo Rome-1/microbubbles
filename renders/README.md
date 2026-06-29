@@ -14,3 +14,42 @@ canonical reference) — sparse on purpose.
 | `04_diff_svd_aggressive_vs_baseline.png` | baseline vs aggressive SVD cutoff, signed coronal diff (red=more, blue=less). Modestly suppresses peripheral clutter. |
 
 Full-baseline renders + the substantive clutter/detection-insight diffs land as those runs complete.
+
+## Session-3 (2026-06-29): full-223 composite renders — baseline vs headline
+
+The headline = **`base223_best`** (elevation-anisotropic Kalman tracking, g3r10+gap6) vs the
+**`base223`** baseline (default tracking, same 223-acq adaptive detections). The tracking win is
+FRC + saturation cross-validated (see `docs/ideation/10-composite-223-results.md`).
+
+### `angiogram/` — the "beautiful" demo-style render (START HERE)
+Coronal **localization-density angiograms** (accumulate all localizations → fine x–z grid → PSF blur
+→ colormap). This is the standard ULM angiogram look — crisp layered vasculature on black — and
+collapses the weak synthesized-elevation axis. View the PNGs directly.
+
+| File | What it is |
+| --- | --- |
+| `angiogram/sidebyside_hot.png` | **baseline vs composite, side by side** — the money shot |
+| `angiogram/composite_coronal_hot.png` | full-res composite (hot colormap) |
+| `angiogram/baseline_coronal_hot.png` | full-res baseline |
+| `angiogram/{baseline,composite}_coronal_gray.png` | grayscale variants |
+
+Caveat: faint vertical streaking = the axial point-spread of 5-transmit-angle imaging (data, not render).
+
+### `screenshots/` — 3D track-viewer captures (Playwright, headless)
+| File | What it is |
+| --- | --- |
+| `screenshots/composite_front.png` | track-viewer looking down elevation — speed-colored track lines |
+| `screenshots/baseline_front.png` | same view, baseline |
+| `screenshots/composite_side_orbited.png` | orbited ~90° — shows the **thin 12.6mm synthesized-elevation slab** + plane layering |
+
+The track-viewer draws individual track LINES (diagnostic); the `angiogram/` density render is the
+demo-style view. The "narrow cross-section" look is the genuinely thin synthesized elevation.
+
+### `track_viewer_{baseline,composite}/` — interactive 3D (Three.js, rotatable, velocity-colored)
+Self-contained bundles. To view locally:
+```
+cd renders/track_viewer_composite && python3 -m http.server 8765
+# then open http://localhost:8765/  (drag to orbit; Speed Filter slider top-right)
+```
+`composite` = base223_best (254k tracks), `baseline` = base223 (168k tracks). `data/tracks.bin` is the
+v3 track binary (force-added past the repo's `*.bin` ignore).
