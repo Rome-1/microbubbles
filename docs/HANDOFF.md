@@ -9,9 +9,35 @@ committed + pushed unless noted.
 We took Aleph's public 3D ULM pipeline, made it correct + deterministic + fast +
 reliable on Modal, built an insight→diff→benchmark machine, ran a cross-model
 (Opus+Codex) ideation to a consensus 10 improvements, built + cross-checked all 10,
-and started the bake-off. Best validated improvement so far: **region-SVD + Kalman
-predicted-gate composite (+50% track length vs baseline)**; **track stitching shows
-+146% length but a straightness regression to tune**. A full 223-acq baseline exists.
+and ran the bake-offs with a real no-GT arbiter (split-half FRC).
+
+## ⭐ SESSION 2 RESULTS (2026-06-28/29) — see `docs/ideation/08-bakeoff-results.md`
+**Two validated wins, FRC-arbitrated (split-half acq-parity reproducibility):**
+1. **HEADLINE: elevation-anisotropic Kalman = `g3r10 + max_gap6`** (elev gate ×3, R_yy ×10,
+   max_gap 6, prediction OFF, intensity OFF). FRC: **repro +9.3 %, lateral res +12 % finer,
+   3D res +49 % finer**, no frag penalty. The tracker was isotropic — it trusted our
+   1-row SYNTHESIZED elevation as much as well-resolved x/z; down-weighting it is the lever
+   BOTH Opus+Codex independently predicted. gpred + intensity-cost *hurt* on top (don't
+   extrapolate the unreliable elevation velocity). Built in `tracking.py` (backward-compat).
+2. **SVD cutoff: the old "adaptive" cut was a SILENT CONSTANT 70-mode removal** (at 222 Hz no
+   temporal mode's centroid exceeds tissue_freq=100). Data wants a SMALL cut; the data-driven
+   **knee (~17) beats the floor** (repro +4.3 %, xz +9 % finer). New `svd_method="knee"`
+   (`svd_knee.py`: Kneedle low cut + B18 spatial-correlation + MP high-order noise cut).
+   CAVEAT: FRC repro is confounded by static tissue for the cutoff axis (cross-check
+   straightness); effect real but more modest than the tracking win.
+
+**New infra built this session:** `svd_knee.py` (knee/B18/MP), `frc.py` (split-half FRC
+arbiter, the no-GT judge), `detect_acqs_multi` (fused multi-variant sweep: beamform once →
+N SVD filters, ~5× cheaper), elev/gap/intensity params on `kalman_tracking_3d`/`track_acqs`/
+`retrack`. Tests: 85 passed, 1 skip.
+
+**RECOMMENDED COMPOSITE (next session):** detection `svd_method=knee` + tracking
+`g3r10 + max_gap6`. Scale to 223 + build the Three.js track-viewer render (mb-crr.19.7) on it.
+NOTE: the 223 best-tracking scale-up hit a Modal detached-client issue (`track_acqs` on the
+223-acq base tag); retry launching via the `run_in_background` Bash pattern (inner `&`+`wait`),
+NOT a foreground bash (it times out at 2 min and kills the modal clients).
+
+### (prior best, superseded as headline) region-SVD + Kalman predicted-gate composite (+50% length); stitching +146% length but straightness −38%. Full 223-acq baseline exists.
 
 ## How to resume (environment)
 - Repo: `/home/rome/gt/microbubbles/crew/cajal`. `source /home/rome/.venv/bin/activate`.
