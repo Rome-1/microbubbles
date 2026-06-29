@@ -83,7 +83,63 @@ extrapolating the unreliable elevation *velocity* (gpred) propagates noise, so a
 elevation gate with NO prediction wins. The earlier `gp_i3_g6` "best" was a non-monotonic
 artifact. → Composite uses **g3r10 + max_gap6, gpred off, intensity off**.
 
-## SVD-cutoff sweep — IN FLIGHT (6 variants × 60 acqs, fused beamform)
-Single-acq detection preview (acq 0): fix8 371k, fix17 486k, knee 489k (+8.7 % vs
-floor 450k), fix30 470k, fix70/floor 450k, **kneeH (knee+MP noise cut) 542k (+20 %)**.
-Track-level bench pending detection completion → track_acqs each → bench vs base60.
+## SVD-cutoff sweep (6 variants × 41 acqs, fused beamform, baseline iso tracking)
+
+Isolates the DETECTION/SVD change (identical baseline tracking for all 6; all 6 tags
+trimmed to the identical 41-acq order-set). FRC + bench:
+
+| variant (low cut) | xz_res_mm | repro_score | straightness | frag short/long | occupied | n_tracks |
+|-------------------|------:|------:|------:|------:|------:|------:|
+| fix70 (floor, =old default) | 0.791 | 0.774 | 0.872 | 289 | 0.834 | 694k |
+| fix30  | 0.794 | 0.788 | 0.875 | 239 | 0.850 | 856k |
+| fix17  | 0.656 | 0.798 | 0.869 | 105 | 0.860 | 1050k |
+| **knee (≈17, data-driven)** | 0.719 | 0.807 | 0.872 | 200 | 0.856 | 988k |
+| fix8   | 0.323 | **0.813** | **0.834** | 16.5 | 0.854 | 1116k |
+| kneeH (knee+MP noise cut) | **0.323** | 0.806 | **0.894** | 3125 | 0.737 | 367k |
+
+**Findings:**
+1. **The floor-70 default is confirmed bad** — worst FRC (0.774) and coarsest xz (0.791).
+   Removing FEWER tissue modes monotonically improves FRC + xz_res. **The knee (17) is a
+   solid, principled win over the floor** (repro +4.3 %, xz +9 % finer, straightness held).
+2. **METHODOLOGICAL CAVEAT (important):** FRC's acq-parity split is **confounded for the
+   SVD-cutoff question** — static tissue clutter reproduces across even/odd halves too, so
+   removing fewer tissue modes inflates repro_score with *clutter*, not just blood. The tell:
+   **fix8 (remove only 8) has the best repro_score/xz BUT the lowest straightness (0.834)** —
+   consistent with retained tissue adding reproducible-but-wandering tracks. So fix8's raw FRC
+   "win" is partly clutter. (FRC was a clean arbiter for #4 because tracking only reorganizes
+   fixed detections; it is NOT clean when the lever changes how much tissue is retained.)
+   → **Pick the knee (data-driven ~17): high repro AND good straightness (0.872), the best
+   balance.** Treat fix8 cautiously; validate any sub-knee cutoff against a clutter check
+   (near-zero-velocity / low-straightness track fraction) before adopting.
+3. **MP high-order noise cutoff (kneeH) is a real, separate lever:** 2.4× finer lateral
+   resolution (xz 0.323) and the best straightness (0.894) — it sharpens by removing noise
+   modes. Cost: lower coverage (0.737) + heavy fragmentation (it also removes weak signal).
+   Best used *with* a small low cutoff and gentler tuning; promising for a resolution pass.
+
+**Verdict:** SVD cutoff matters (floor-70 was 4–10× too aggressive); **use the data-driven
+knee (low cut) for detection**, with the MP noise cutoff as an optional resolution lever.
+Effect is real but more modest/confounded than the tracking lever — the **elevation-
+anisotropic Kalman remains the headline win.**
+
+## Synthesis + recommended composite
+
+**Two validated levers this session (no-GT, FRC-arbitrated):**
+1. **Elevation-anisotropic Kalman (#4) — the headline win.** `g3r10 + max_gap6`
+   (elev gate ×3, R_yy ×10, max_gap 6, prediction OFF, intensity OFF): repro +9.3 %,
+   lateral res +12 % finer, 3D res +49 % finer, no frag penalty. FRC-clean (tracking
+   only reorganizes fixed detections). Predictive gating and intensity cost both *hurt*
+   on top — once elevation is down-weighted, don't extrapolate its unreliable velocity.
+2. **SVD low cutoff (mb-3k4) — confirmed real, more modest.** The old "adaptive" cut was a
+   silent constant 70-mode removal; the data wants a SMALL cutoff. The data-driven knee
+   (~17) beats the floor (repro +4.3 %, xz +9 % finer) with good straightness. MP high-order
+   noise cutoff is a separate resolution lever (2.4× finer xz, coverage cost).
+
+**Recommended composite for the 223 scale-up + render:**
+detection = `svd_method=knee` (small data-driven low cut); tracking = `g3r10 + max_gap6`.
+Then build the Three.js track-viewer render (mb-crr.19.7) on the composite track set.
+
+**Caveats carried forward:** no ground truth; FRC repro_score is confounded by static tissue
+for the SVD-cutoff axis (cross-check straightness/velocity); yz/xy FRC planes saturate at the
+coarse-y limit (rely on xz + repro_score + straightness). The 223-acq best-tracking scale-up
+hit a Modal detached-client issue (track_acqs on the 223-acq base tag) — retry with the
+run_in_background launch pattern.
