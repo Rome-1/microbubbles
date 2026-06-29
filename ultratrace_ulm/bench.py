@@ -17,6 +17,14 @@ JUDGEMENT NOTES (read before trusting any single number):
   * The comparison table is DECISION SUPPORT for a human, not a verdict. Use it
     to quantify and localize differences and to flag suspicious changes.
 
+Three families of no-ground-truth proxy live here:
+  * track_metrics      -- length / fragmentation / straightness of the tracks.
+  * density_metrics    -- structure / contrast of the coronal render.
+  * saturation_metrics -- does occupied area PLATEAU as acquisitions accumulate
+    (a finite vascular bed fills and saturates; clutter keeps lighting up fresh
+    voxels and never does). The over-merge / manufactured-coverage arbiter that
+    pairs with the split-half FRC arbiter in ``ultratrace_ulm.frc``.
+
 Pure numpy. No cupy / h5py / GPU. Safe to run locally.
 """
 
@@ -193,6 +201,24 @@ def track_metrics(data: dict) -> dict:
     }
 
 
+def _coronal_ranges(data: dict) -> tuple[list, list]:
+    """Coronal (x, z) histogram ranges from the data bounds, with degenerate
+    (zero-width) axes nudged to unit width so histogramming is well-defined.
+
+    Shared by ``density_metrics`` and ``saturation_metrics`` so both bin onto
+    the SAME coronal grid (their occupancy numbers are then comparable).
+    """
+    bmin = data["bounds_min"]
+    bmax = data["bounds_max"]
+    xr = [float(bmin[0]), float(bmax[0])]
+    zr = [float(bmin[2]), float(bmax[2])]
+    if xr[1] <= xr[0]:
+        xr[1] = xr[0] + 1.0
+    if zr[1] <= zr[0]:
+        zr[1] = zr[0] + 1.0
+    return xr, zr
+
+
 def density_metrics(data: dict, bins: int = 256) -> dict:
     """Render-quality proxies from the coronal (x vs z) track-density histogram.
 
@@ -215,15 +241,7 @@ def density_metrics(data: dict, bins: int = 256) -> dict:
     positions = data["positions"]
     x = positions[:, 0]
     z = positions[:, 2]
-    bmin = data["bounds_min"]
-    bmax = data["bounds_max"]
-    xr = [float(bmin[0]), float(bmax[0])]
-    zr = [float(bmin[2]), float(bmax[2])]
-    # Guard against degenerate (zero-width) ranges.
-    if xr[1] <= xr[0]:
-        xr[1] = xr[0] + 1.0
-    if zr[1] <= zr[0]:
-        zr[1] = zr[0] + 1.0
+    xr, zr = _coronal_ranges(data)
 
     h, _, _ = np.histogram2d(x, z, bins=bins, range=[xr, zr])
     total_bins = int(h.size)
@@ -255,9 +273,197 @@ def density_metrics(data: dict, bins: int = 256) -> dict:
     }
 
 
+def _fit_saturation(t: np.ndarray, area: np.ndarray) -> dict:
+    """Least-squares fit of the Hingot (2019) ULM saturation model
+
+        A(t) = C0 * (1 - exp(-kappa * t))
+
+    to a coverage-vs-acquisition curve, PURE NUMPY (no scipy). For any fixed
+    ``kappa`` the model is linear in C0, so the best C0 has the closed form
+    ``C0 = sum(A g) / sum(g^2)`` with ``g = 1 - exp(-kappa t)``. We therefore
+    only have to search the single nonlinear parameter ``kappa``: a coarse
+    geometric grid for the basin, then a golden-section refine. Deterministic.
+
+    Returns C0, kappa, the fit R^2, and -- as a model-free cross-check on
+    whether the curve really plateaus -- the R^2 of a plain LINEAR fit. A curve
+    that genuinely saturates is fit much better by the exponential than the line;
+    one that keeps climbing (clutter that never fills a finite vascular bed) is
+    fit about equally well by a line, and ``linear_r2`` approaches ``r2``.
+    """
+    t = np.asarray(t, dtype=np.float64).reshape(-1)
+    a = np.asarray(area, dtype=np.float64).reshape(-1)
+    out = {"c0": float("nan"), "kappa": float("nan"),
+           "r2": float("nan"), "linear_r2": float("nan")}
+    if t.size < 3 or not np.any(a > 0):
+        return out
+
+    sst = float(np.sum((a - a.mean()) ** 2))
+
+    def _c0_sse(kappa: float) -> tuple[float, float]:
+        g = 1.0 - np.exp(-kappa * t)
+        gg = float(np.sum(g * g))
+        if gg <= 0:
+            return 0.0, sst
+        c0 = max(float(np.sum(a * g) / gg), 0.0)
+        sse = float(np.sum((a - c0 * g) ** 2))
+        return c0, sse
+
+    # Coarse geometric grid over kappa, then golden-section refine in log-kappa.
+    t_span = float(t[-1] - t[0]) or 1.0
+    grid = np.geomspace(1e-3 / t_span, 50.0 / max(t[0], 1.0), 400)
+    sses = np.array([_c0_sse(k)[1] for k in grid])
+    j = int(np.argmin(sses))
+    lo = float(np.log(grid[max(j - 1, 0)]))
+    hi = float(np.log(grid[min(j + 1, grid.size - 1)]))
+    if hi > lo:
+        gr = (np.sqrt(5.0) - 1.0) / 2.0
+        c, d = hi - gr * (hi - lo), lo + gr * (hi - lo)
+        fc, fd = _c0_sse(np.exp(c))[1], _c0_sse(np.exp(d))[1]
+        for _ in range(60):
+            if fc < fd:
+                hi, d, fd = d, c, fc
+                c = hi - gr * (hi - lo)
+                fc = _c0_sse(np.exp(c))[1]
+            else:
+                lo, c, fc = c, d, fd
+                d = lo + gr * (hi - lo)
+                fd = _c0_sse(np.exp(d))[1]
+        kappa = float(np.exp((lo + hi) / 2.0))
+    else:
+        kappa = float(grid[j])
+
+    c0, sse = _c0_sse(kappa)
+    out["c0"] = c0
+    out["kappa"] = kappa
+    out["r2"] = float(1.0 - sse / sst) if sst > 0 else float("nan")
+
+    # Plain linear fit A ~ b0 + b1 t, for the saturation/linear discriminator.
+    b1, b0 = np.polyfit(t, a, 1)
+    lin_sse = float(np.sum((a - (b0 + b1 * t)) ** 2))
+    out["linear_r2"] = float(1.0 - lin_sse / sst) if sst > 0 else float("nan")
+    return out
+
+
+def saturation_metrics(data: dict, bins: int = 256) -> dict:
+    """ULM coverage-saturation proxy (no ground truth), per Hingot 2019.
+
+    The vascular bed is FINITE: as independent acquisitions accumulate,
+    microbubbles keep landing in the SAME real vessels, so the occupied area of
+    the coronal render rises fast then PLATEAUS once the bed is filled. Spurious
+    tracks have no such ceiling -- each new acquisition lights up fresh, random,
+    non-reproducing voxels, so a clutter-heavy run's coverage keeps climbing and
+    never saturates. Saturation behaviour therefore separates "recovered a finite
+    vasculature" from "manufacturing area", which raw track count cannot.
+
+    We accumulate acquisitions in temporal order (a point's acquisition is
+    ``frame // frames_per_acq``), and for each prefix of k acquisitions measure
+    the occupied-bin count of the coronal (x, z) histogram -- computed in one
+    pass as, per bin, the FIRST acquisition rank that occupies it, then a cumsum.
+    The model A(t)=C0(1-e^{-kappa t}) is fit in pure numpy (see _fit_saturation).
+
+    Returns (all PROXIES; finer interpretation in the module docstring):
+      sat_n_acqs              : # distinct acquisitions in the curve.
+      sat_ceiling_fraction    : C0 / total_bins -- asymptotic occupied fraction.
+      sat_rate_kappa          : kappa (per acquisition); larger = fills faster.
+      sat_acqs_to_90pct       : ln(10)/kappa, acquisitions to reach 90% of C0.
+                                Small = coverage plateaus EARLY (efficient/real);
+                                large or inf = never saturates (clutter risk).
+      sat_fraction_of_ceiling : A(t_max)/C0 = 1-e^{-kappa t_max}. How saturated
+                                the FULL render is; near 1 = filled the bed.
+      sat_r2 / sat_linear_r2  : exp-fit vs linear-fit goodness. r2>>linear_r2 =
+                                genuinely saturating; r2~=linear_r2 = still-linear
+                                growth (coverage never plateaus -> clutter flag).
+      sat_late_early_slope_ratio : model-free check. dArea/dacq over the LAST half
+                                vs the FIRST half. ~0 = plateaued; ~1 = still
+                                climbing linearly (clutter). Lower = better.
+      sat_final_occupied_fraction : occupied fraction at the full data (sanity).
+      curve_acq / curve_occupied_fraction : the raw curve, for plotting.
+    """
+    out = {
+        "sat_n_acqs": 0,
+        "sat_ceiling_fraction": float("nan"),
+        "sat_rate_kappa": float("nan"),
+        "sat_acqs_to_90pct": float("nan"),
+        "sat_fraction_of_ceiling": float("nan"),
+        "sat_r2": float("nan"),
+        "sat_linear_r2": float("nan"),
+        "sat_late_early_slope_ratio": float("nan"),
+        "sat_final_occupied_fraction": 0.0,
+        "curve_acq": [],
+        "curve_occupied_fraction": [],
+    }
+
+    positions = data["positions"]
+    frames = np.asarray(data["frames"], dtype=np.float64)
+    fpa = max(int(data.get("frames_per_acq") or 0), 1)
+    total_points = positions.shape[0]
+    if total_points == 0:
+        return out
+
+    x = positions[:, 0].astype(np.float64)
+    z = positions[:, 2].astype(np.float64)
+    xr, zr = _coronal_ranges(data)
+
+    # Coronal bin index per point (matches density_metrics' histogram grid).
+    bx = bins / (xr[1] - xr[0])
+    bz = bins / (zr[1] - zr[0])
+    ix = np.clip(((x - xr[0]) * bx).astype(np.int64), 0, bins - 1)
+    iz = np.clip(((z - zr[0]) * bz).astype(np.int64), 0, bins - 1)
+    bin_id = ix * bins + iz
+    total_bins = bins * bins
+
+    # Acquisition rank per point: distinct acqs in temporal order -> 0..K-1.
+    acq = np.floor(frames / fpa).astype(np.int64)
+    _, rank = np.unique(acq, return_inverse=True)
+    rank = np.asarray(rank, dtype=np.int64).reshape(-1)
+    k = int(rank.max()) + 1
+    out["sat_n_acqs"] = k
+
+    # First acquisition rank that occupies each coronal bin (sentinel = k).
+    first_rank = np.full(total_bins, k, dtype=np.int64)
+    np.minimum.at(first_rank, bin_id, rank)
+    occupied = first_rank[first_rank < k]
+    if occupied.size == 0:
+        return out
+    new_per_rank = np.bincount(occupied, minlength=k).astype(np.float64)
+    area = np.cumsum(new_per_rank)                 # occupied bins after each acq
+    t = np.arange(1, k + 1, dtype=np.float64)
+    frac = area / total_bins
+
+    out["sat_final_occupied_fraction"] = float(frac[-1])
+    out["curve_acq"] = [int(v) for v in t]
+    out["curve_occupied_fraction"] = [float(v) for v in frac]
+
+    if k < 3:
+        # Too few acquisitions to fit a saturation curve; report the raw curve.
+        return out
+
+    fit = _fit_saturation(t, area)
+    c0, kappa = fit["c0"], fit["kappa"]
+    out["sat_r2"] = fit["r2"]
+    out["sat_linear_r2"] = fit["linear_r2"]
+    if np.isfinite(c0) and c0 > 0:
+        out["sat_ceiling_fraction"] = float(c0 / total_bins)
+        out["sat_fraction_of_ceiling"] = float(area[-1] / c0)
+    if np.isfinite(kappa) and kappa > 0:
+        out["sat_rate_kappa"] = float(kappa)
+        out["sat_acqs_to_90pct"] = float(np.log(10.0) / kappa)
+
+    # Model-free late/early slope ratio over the cumulative area curve.
+    half = k // 2
+    early = (area[half - 1] - area[0]) / max(t[half - 1] - t[0], 1.0)
+    late = (area[-1] - area[half]) / max(t[-1] - t[half], 1.0)
+    if early > 0:
+        out["sat_late_early_slope_ratio"] = float(late / early)
+    elif late <= 0:
+        out["sat_late_early_slope_ratio"] = 0.0
+    return out
+
+
 def compare(paths: Sequence[str], labels: Sequence[str], bins: int = 256) -> dict:
-    """Run track_metrics + density_metrics on each path; return a structured
-    comparison: {"labels": [...], "paths": [...], "runs": {label: {...}}}.
+    """Run track_metrics + density_metrics + saturation_metrics on each path;
+    return a structured comparison:
+    {"labels": [...], "paths": [...], "runs": {label: {...}}}.
     """
     if len(paths) != len(labels):
         raise ValueError(f"got {len(paths)} paths but {len(labels)} labels")
@@ -268,6 +474,7 @@ def compare(paths: Sequence[str], labels: Sequence[str], bins: int = 256) -> dic
             "path": str(path),
             "track": track_metrics(data),
             "density": density_metrics(data, bins=bins),
+            "saturation": saturation_metrics(data, bins=bins),
         }
     return {"labels": list(labels), "paths": [str(p) for p in paths], "runs": runs}
 
@@ -297,6 +504,13 @@ _TABLE_ROWS = [
     ("contrast_cnr_proxy", "contrast_cnr_proxy", "density"),
     ("entropy_bits", "entropy_bits", "density"),
     ("entropy_ratio", "entropy_ratio", "density"),
+    ("sat_ceiling_fraction", "sat_ceiling_frac", "saturation"),
+    ("sat_acqs_to_90pct", "sat_acqs_to_90%", "saturation"),
+    ("sat_fraction_of_ceiling", "sat_frac_of_ceiling", "saturation"),
+    ("sat_rate_kappa", "sat_kappa", "saturation"),
+    ("sat_r2", "sat_r2", "saturation"),
+    ("sat_linear_r2", "sat_linear_r2", "saturation"),
+    ("sat_late_early_slope_ratio", "sat_late/early_slope", "saturation"),
 ]
 
 

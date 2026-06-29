@@ -27,9 +27,10 @@ and ran the bake-offs with a real no-GT arbiter (split-half FRC).
    straightness); effect real but more modest than the tracking win.
 
 **New infra built this session:** `svd_knee.py` (knee/B18/MP), `frc.py` (split-half FRC
-arbiter, the no-GT judge), `detect_acqs_multi` (fused multi-variant sweep: beamform once →
-N SVD filters, ~5× cheaper), elev/gap/intensity params on `kalman_tracking_3d`/`track_acqs`/
-`retrack`. Tests: 85 passed, 1 skip.
+arbiter, the no-GT judge), `bench.py:saturation_metrics` (Hingot-2019 coverage-saturation
+arbiter — the over-merge/manufactured-coverage proxy that pairs with FRC), `detect_acqs_multi`
+(fused multi-variant sweep: beamform once → N SVD filters, ~5× cheaper), elev/gap/intensity
+params on `kalman_tracking_3d`/`track_acqs`/`retrack`. Tests: 88 passed, 1 skip.
 
 **RECOMMENDED COMPOSITE (next session):** detection `svd_method=knee` + tracking
 `g3r10 + max_gap6`. Scale to 223 + build the Three.js track-viewer render (mb-crr.19.7) on it.
@@ -100,7 +101,9 @@ Codex=detection/SVD; both cross-checked each other (Codex found + Opus fixed a r
 - Finish Opus tracking items #4, #8, #9 (edit `kalman_tracking_3d`).
 - Consume low-conf (#5) in tracking (continuation-only).
 - Run the GPU bake-offs (combo8 → 60-acq) for #2/#3/#6/#7; tune stitch `vel_cos_min`(~0.7) + `tol_elev`.
-- Add no-GT metrics to bench.py: split-half reproducibility (#10), FRC, saturation (see `docs/literature/`).
+- ~~Add no-GT metrics to bench.py: split-half reproducibility (#10), FRC, saturation~~ **DONE** (`frc.py`
+  = split-half FRC arbiter; `bench.py:saturation_metrics` = Hingot-2019 `C₀(1−e^{−κt})` coverage-saturation).
+  Remaining sub-item of agreed-#10b: per-elev-plane occupancy + midplane-attraction audit (still TODO).
 - Scale the winning composite to full 223; build the real Three.js `track-viewer` 3D render
   (baseline vs improved) — the "beautiful" render Rome asked about (current MIPs are diagnostic only).
 - Literature deep-dives running → `docs/literature/lit-detection-svd.md`, `lit-tracking-eval.md`
