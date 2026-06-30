@@ -27,6 +27,20 @@ The two are inconsistent by ~3×. If the TRUE frame rate is ~650 Hz (consistent 
 **This needs resolving** — it determines whether the gate is mis-tuned. Check the raw H5 timing
 metadata (PRF / frame interval) or confirm with the data source.
 
+### PROBE RESULT (2026-06-30): frame rate is NOT in the H5
+Probed the raw H5 (`scratchpad/probe_timing.py`). The file stores only `sampling_rate_hz=6.25e6`
+and `tx_freq_hz=2.75e6` — **no PRF / frame rate**. So **222 Hz is an unverified assumption.**
+- Physics (end_depth 40.8mm, c=1600 m/s, 5 angles, 61µs min PRI/transmit → 305µs/frame):
+  **hardware-max ~3,281 Hz**.
+- 4-min anchor (223×702 ÷ 240s): **~652 Hz**.
+- 222 Hz ⇒ 11.8-min acquisition (contradicts the blog's 4 min).
+⇒ **True rate is ~3–15× higher than 222 Hz.** This CONFIRMS over-linking: at 652 Hz our
+0.28mm/frame displacements imply ~180 mm/s — impossibly fast, i.e. the tracker is bridging across
+multiple bubbles. Caveat: the frame rate is a *speed-color* calibration (our speeds are
+underestimated ~3×); the SPATIAL scatter is the over-linking, frame-rate-independent.
+The 222 Hz assumption should be flagged to the data source / corrected (affects speed claims and
+the Kalman velocity prediction).
+
 ## The fix (cheap, upstream of density/render)
 A **tracking-gate tightening / velocity-difference constraint** + **resolved frame rate**, then a
 CPU re-track (no GPU, no full-223 needed to test). This should clean the render by NOT creating the
