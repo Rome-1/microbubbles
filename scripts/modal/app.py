@@ -558,7 +558,8 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
     os.makedirs(ref_dir, exist_ok=True)
     keep = {int(x) for x in keep_orders.split(",") if x.strip() != ""}
 
-    h5, fobj = _open_remote_h5(url)
+    h5, fobj, _src = _open_local_or_remote_h5(url)  # prefer the local volume copy (fast)
+    print(f"[baseline] h5 source={_src}", flush=True)
     all_ids = sorted(int(k) for k in h5["acquisitions"].keys() if str(k).isdigit())
     sel = all_ids[acq_start::acq_step]
     if num_acqs and num_acqs > 0:
@@ -683,7 +684,8 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
         )
     finally:
         h5.close()
-        fobj.close()
+        if fobj is not None:
+            fobj.close()
     vol.commit()
     report = {
         "tag": tag, "n_acqs": len(sel), "tracks_dir": str(out_dir),
@@ -1207,6 +1209,68 @@ def track_acqs(tag: str = "baseline", min_track_length: int = 5,
     n = len(per_acq)
     print(f"DONE track_acqs {tag}: {n} acqs -> {out_dir}")
     return {"out_tag": out_tag, "n_acqs": n, "smoothed": str(smoothed)}
+
+
+# --------------------------------------------------------------------------- #
+# track_refs — CPU. Run the CANONICAL braindump reference recipe (run_tracking =
+# CPU SVD->detect->localize->track) on a set of already-beamformed reference
+# shards, then MERGE the per-shard tracks into one set + export bins. This is the
+# CLEAN production path (~28 tracks/acq, "genuinely flowing") vs the noisier GPU
+# detect_acqs path. Reads beamformed shards from the volume (fast, no remote IQ).
+# --------------------------------------------------------------------------- #
+@app.function(image=cpu_image, timeout=2 * 3600, memory=98304, volumes={"/root/data": vol})
+def track_refs(refs_tag: str = "base60_refs", out_tag: str = "clean_refs",
+               min_track_length: int = 5, frame_rate_hz: float = 222.0) -> dict:
+    import glob
+    import os
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, "/workspace")
+    from ultratrace_ulm.runtime import dump_pickle, load_pickle
+    from ultratrace_ulm.tracking import (
+        TrackingOptions, export_tracks_bin, run_tracking, smooth_tracks_pickle,
+    )
+
+    vol.reload()
+    ref_dir = _guard(f"{DATA_ROOT}/beamformed/{refs_tag}")
+    shards = sorted(glob.glob(os.path.join(ref_dir, "acq_*.h5")))
+    if not shards:
+        raise SystemExit(f"no beamformed shards in {ref_dir}")
+    out_dir = Path(_guard(f"{DATA_ROOT}/tracks/{out_tag}"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    all_tracks, spacing, fpa, params = [], None, None, {}
+    for sh in shards:
+        opts = TrackingOptions(
+            beamformed_path=Path(sh), tracks_path=out_dir / "_tmp.pkl",
+            svd_method="adaptive", knee_filter=True, tissue_freq_hz=100.0,
+            temporal_sigma=0.0, filter_method="svd", svd_low_cutoff=0.1,
+            sigma_threshold=2.0, min_distance=2, smoothing_sigma=1.0,
+            subpixel="centroid", window_size=5, tracking="kalman",
+            frame_rate_hz=frame_rate_hz, max_gap=3, min_track_length=min_track_length,
+            reversal_penalty=10.0, max_cost=10.0)
+        run_tracking(opts)
+        data = load_pickle(opts.tracks_path)
+        tr = data.get("tracks", [])
+        all_tracks.extend(tr)
+        spacing = spacing or data.get("spacing")
+        fpa = fpa or data.get("frames_per_acq")
+        params = data.get("params", params)
+        print(f"{os.path.basename(sh)}: +{len(tr)} tracks (total {len(all_tracks)})", flush=True)
+
+    merged = {"tracks": all_tracks, "spacing": spacing, "frames_per_acq": fpa,
+              "frame_rate": frame_rate_hz, "n_acquisitions": len(shards), "params": params}
+    dump_pickle(merged, out_dir / "tracks.pkl")
+    sm = smooth_tracks_pickle(out_dir / "tracks.pkl", None, sigma=2.0, method="gaussian")
+    for ml in (5, 20, 50):
+        try:
+            export_tracks_bin(sm, out_dir / f"tracks_min{ml}.bin", min_length=ml)
+        except Exception as e:  # noqa: BLE001
+            print(f"skip min{ml}: {e}")
+    vol.commit()
+    print(f"DONE track_refs {refs_tag}: {len(all_tracks)} tracks from {len(shards)} shards -> {out_dir}")
+    return {"out_tag": out_tag, "n_tracks": len(all_tracks), "n_shards": len(shards)}
 
 
 # --------------------------------------------------------------------------- #
