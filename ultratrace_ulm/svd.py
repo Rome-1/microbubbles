@@ -13,6 +13,26 @@ def _component_count(cutoff: float | int | None, n_frames: int) -> int:
     return int(round(value))
 
 
+def _gram_c128(mat: np.ndarray, chunk: int = 300_000) -> np.ndarray:
+    """Temporal Gram ``mat @ mat.conj().T`` accumulated in complex128 (chunked).
+
+    Forming ``M Mᴴ`` squares the condition number; with the tissue/blood dynamic
+    range (~1e3–1e4) a complex64 Gram loses the RETAINED (blood/bubble) subspace
+    and over-suppresses it -> compressed, low-contrast magnitude -> the 2σ
+    detector fires on noise and the localizations don't link (mb-a0a: ~16x fewer
+    tracks than the GPU path). Accumulating the small (F,F) Gram in complex128
+    from complex64 chunks -- exactly as ``gpu_svd.filter_svd_3d_gpu`` does -- keeps
+    the cross-chunk sum stable without a full complex128 copy of the (F, n_vox)
+    matrix. This makes the CPU path numerically match the (correct) GPU path.
+    """
+    n = int(mat.shape[0])
+    g = np.zeros((n, n), dtype=np.complex128)
+    for s0 in range(0, mat.shape[1], chunk):
+        mc = mat[:, s0:s0 + chunk]
+        g += (mc @ mc.conj().T).astype(np.complex128)
+    return g
+
+
 def spectral_centroid_cutoff(
     matrix: np.ndarray,
     frame_rate_hz: float,
@@ -36,7 +56,7 @@ def spectral_centroid_cutoff(
     """
     n_frames = int(matrix.shape[0])
     x = matrix - matrix.mean(axis=0, keepdims=True)
-    cov = x @ x.conj().T
+    cov = _gram_c128(x)  # complex128 Gram (mb-a0a): match the GPU cutoff exactly
     evals, u = np.linalg.eigh(cov)
     u = u[:, np.argsort(evals)[::-1]]
     freqs = np.fft.fftfreq(n_frames, d=1.0 / frame_rate_hz)
@@ -113,11 +133,11 @@ def filter_svd_3d(
     if normalized_method == "none":
         filtered = matrix
     elif normalized_method == "fast":
-        cov = matrix @ matrix.conj().T
+        cov = _gram_c128(matrix)  # complex128 Gram (mb-a0a): preserve the retained blood subspace
         evals, u = np.linalg.eigh(cov)
         u = u[:, np.argsort(evals)[::-1]]
         stop = n_frames - high_remove if high_remove > 0 else n_frames
-        uc = u[:, low:stop]
+        uc = u[:, low:stop].astype(np.complex64)  # project in complex64 (memory-safe, matches GPU)
         filtered = uc @ (uc.conj().T @ matrix)
     elif normalized_method == "full":
         u, s, vh = np.linalg.svd(matrix, full_matrices=False)
