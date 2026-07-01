@@ -537,7 +537,8 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
              min_track_length: int = 5, svd_method: str = "adaptive",
              use_gpu_svd: bool = True, motion: bool = False,
              filter_variant: str = "global", gate_on_prediction: bool = False,
-             n_z_blocks: int = 3, n_x_blocks: int = 3, tag: str = "baseline") -> dict:
+             n_z_blocks: int = 3, n_x_blocks: int = 3, sigma_threshold: float = 2.0,
+             tag: str = "baseline") -> dict:
     import json
     import os
     import sys
@@ -648,7 +649,7 @@ def baseline(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: float 
     opts = TrackingOptions(
         beamformed_path=Path(f"{DATA_ROOT}/none"), tracks_path=out_dir / "tracks.pkl",
         svd_method=svd_method, knee_filter=True, tissue_freq_hz=100.0, temporal_sigma=0.0,
-        filter_method="svd", svd_low_cutoff=0.1, sigma_threshold=2.0, min_distance=2,
+        filter_method="svd", svd_low_cutoff=0.1, sigma_threshold=sigma_threshold, min_distance=2,
         smoothing_sigma=1.0, subpixel="centroid", window_size=5, tracking="kalman",
         frame_rate_hz=frame_rate_hz, max_gap=3, min_track_length=min_track_length,
         reversal_penalty=10.0, max_cost=10.0, gate_on_prediction=gate_on_prediction,
