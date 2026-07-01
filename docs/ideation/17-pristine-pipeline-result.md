@@ -57,6 +57,53 @@ Figure: `renders/pristine_shipped/compare_3way_ref_vs_pristine-c64_vs_ours-c128.
 - **mb-a0a stays valid** as a *correctness* fix (c128 is the numerically right SVD);
   it is simply the wrong lever for *this render*, which wants the sparse shipped output.
 
+## UPDATE 2 (2026-07-01, after Rome: "our match looks nothing like theirs; replicate exactly")
+
+Two corrections to the above + a root-cause on the remaining gap.
+
+**Verified we DO run their code.** Diffed pristine `braindump` (cloned) vs our fork:
+- `beamform_core.py`: only adds `stream_accumulate` (a memory optimization) — the
+  comment states output is **numerically identical**. Beamform ≡ pristine.
+- `tracking.py`: fork adds opt-in knobs (gate_on_prediction, elev_meas/gate_factor,
+  intensity_cost) whose **defaults reproduce pristine exactly**. Track ≡ pristine.
+- `svd.py`: the mb-a0a c128 change (reverted for the c64 experiments).
+So the pipeline code is not the divergence.
+
+**Correction A — density.** The "match" I first served was the SPARSE c64 (60/acq,
+the mb-a0a-corrupted path, environment-dependent). The README production density is
+~260/acq. The robust way to hit it is **c128 + 3.5σ** (`ref223_c*`, 41,176 tracks /
+223 = 185/acq, physiological speeds). That is the correct "match" density.
+
+**Correction B — the render was never artifact-masked, and the artifacts are huge.**
+Histogramming the c128+3.5σ localizations (empirical, not theory):
+- **Near-field skull band at z≈8mm = 61,765 pts = 22% of ALL points** (dominant
+  horizontal band; the shallowest depth bin).
+- **Elevation-edge pile-up at |y|=6.25mm** (the outermost *synthesized* elevation
+  planes — spurious; elevation is synthesized from ONE physical receive row).
+- Together these are **~49% of all points** = pure artifact.
+- **Residual depth bands at z≈8/13.5/19mm (~5.5mm regular spacing)** — reverberation-
+  like. They **persist in a thin central elevation slab (|y|<2mm)**, so they are real
+  depth structure in the beamformed data, NOT a projection/elevation-collapse artifact
+  (some may be real horizontal cortical surface vessels; the reference has one too).
+
+Masking skull (z<11mm) + elevation edges (|y|>5.5mm) → 22,208 tracks, removes the
+gross bands, and the real cortical arc + vessels emerge (renders/pristine_shipped/
+compare_ref_vs_c128-3.5sigma_masked.png). **But it is still a fuzzy, banded point
+cloud — the reference is thin, continuous, resolved vessels.**
+
+**Root cause of the REMAINING gap (honest):** the public braindump defaults, run
+faithfully, do NOT reproduce the blog render. What's left is (1) **localization
+crispness** — centroid sub-pixel scatters points off the vessel centerline; the
+reference's points sit on thin vessels (needs Gaussian/PSF sub-pixel fit — `psf.py`
+exists but is not in the default path); and (2) **reverberation depth-bands** the
+default filter doesn't remove. This is the mb-45z gap, now root-caused. Note also
+the true pristine `run` end-to-end is **impractical** on 223: its CPU c64 track is
+pathologically slow (a 6-acq probe hung in the SVD; the earlier full CPU run was
+"killed" for the same reason) — which is why the GPU c128 path exists at all.
+
+**Served viewers (live):** launcher `match/` now = c128+3.5σ artifact-masked;
+`dense/` = base223_best unmasked (contrast).
+
 ## Repro
 ```
 # points render of any shipped tracks.bin (the exact viewer projection + speed color):

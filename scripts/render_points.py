@@ -29,9 +29,18 @@ def parse_bin(path):
                 bmin=np.array(bmin), bmax=np.array(bmax), table=table, pts=pts)
 
 def render(binpath, outpath, vmax=0.1713, gain=1.6, psf=0.7, W=1600, H=1050,
-           hax=0, vax=2, flip_v=True, margin=0.06):
+           hax=0, vax=2, flip_v=True, margin=0.06,
+           zmin=None, zmax=None, elev_absmax=None):
     d = parse_bin(binpath)
     pts = d["pts"]
+    # artifact masks: near-field skull band (small z/depth) + synthesized
+    # elevation-edge pile-up (|y| near the outermost planes).
+    keep = np.ones(len(pts), dtype=bool)
+    if zmin is not None: keep &= pts[:, 2] >= zmin
+    if zmax is not None: keep &= pts[:, 2] <= zmax
+    if elev_absmax is not None: keep &= np.abs(pts[:, 1]) <= elev_absmax
+    pts = pts[keep]
+    print(f"  mask kept {len(pts)}/{len(d['pts'])} pts")
     x = pts[:, hax]; z = pts[:, vax]; speed = pts[:, 4]
     # world extent from bounds (keep aspect via data range)
     xmin, xmax = d["bmin"][hax], d["bmax"][hax]
@@ -80,4 +89,7 @@ if __name__ == "__main__":
         if a == "--vmax": kw["vmax"] = float(args[i+1])
         if a == "--gain": kw["gain"] = float(args[i+1])
         if a == "--psf": kw["psf"] = float(args[i+1])
+        if a == "--zmin": kw["zmin"] = float(args[i+1])
+        if a == "--zmax": kw["zmax"] = float(args[i+1])
+        if a == "--elev-absmax": kw["elev_absmax"] = float(args[i+1])
     render(binpath, outpath, **kw)
