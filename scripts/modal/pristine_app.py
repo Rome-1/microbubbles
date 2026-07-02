@@ -85,7 +85,59 @@ def pristine_beamform(num_acqs: int = 8, spatial_tgc: bool = True,
     return {"out": outp, "num_acqs": num_acqs}
 
 
+@app.function(image=pristine_image, timeout=2 * 3600, memory=65536, cpu=16.0,
+              volumes={"/root/data": vol})
+def compare_beamform(pristine_h5: str = "pristine_out/beamformed.h5",
+                     fork_shard: str = "beamformed/shards/acq_0000.h5", order: int = 0) -> dict:
+    """Element-wise compare pristine vs fork beamformed compound for one acq."""
+    import h5py, numpy as np
+    vol.reload()
+    with h5py.File(f"{DATA_ROOT}/{pristine_h5}", "r") as p:
+        pc = np.asarray(p[f"acquisitions/{order}/meta/compound_image"], dtype=np.complex64)
+    with h5py.File(f"{DATA_ROOT}/{fork_shard}", "r") as f:
+        k = sorted(f["acquisitions"].keys(), key=int)[0]
+        fc = np.asarray(f[f"acquisitions/{k}/meta/compound_image"], dtype=np.complex64)
+    rep = {"pristine_shape": list(pc.shape), "fork_shape": list(fc.shape)}
+    if pc.shape != fc.shape:
+        rep["note"] = "shape mismatch"; print(rep); return rep
+    diff = np.abs(pc - fc)
+    denom = np.abs(pc).mean() + 1e-20
+    rep.update({
+        "max_abs_diff": float(diff.max()), "mean_abs_diff": float(diff.mean()),
+        "rel_mean_diff": float(diff.mean() / denom),
+        "pristine_mean_abs": float(np.abs(pc).mean()), "fork_mean_abs": float(np.abs(fc).mean()),
+        "allclose_rtol1e-4": bool(np.allclose(pc, fc, rtol=1e-4, atol=1e-3)),
+        "bit_identical": bool(np.array_equal(pc, fc)),
+    })
+    print(rep); return rep
+
+
+@app.function(image=pristine_image, timeout=4 * 3600, memory=98304, cpu=16.0,
+              volumes={"/root/data": vol})
+def pristine_track(beamformed: str = "pristine_out/beamformed.h5", frame_rate: float = 222.0,
+                   min_length: int = 5, work: str = "pristine_out") -> dict:
+    """Verbatim pristine `track` (CPU c64) + `track-viewer` on an existing beamformed h5."""
+    import os
+    vol.reload()
+    workdir = f"{DATA_ROOT}/{work}"
+    tracks = f"{workdir}/tracks.pkl"
+    _run(["ultratrace-ulm", "track", "--beamformed", f"{DATA_ROOT}/{beamformed}",
+          "--tracks", tracks, "--svd-method", "adaptive", "--frame-rate", str(frame_rate),
+          "--knee-filter", "--temporal-sigma", "0", "--sigma-threshold", "2.0",
+          "--svd-low-cutoff", "0.1", "--min-distance", "2", "--smoothing-sigma", "1.0",
+          "--tracking", "kalman", "--max-gap", "3", "--min-track-length", "5",
+          "--max-cost", "10", "--export-dir", workdir, "--min-lengths", "5", "20", "50"])
+    vol.commit()
+    _run(["ultratrace-ulm", "track-viewer", "--tracks", f"{workdir}/tracks_smoothed.pkl",
+          "--output-dir", f"{workdir}/viewer", "--min-length", str(min_length)])
+    vol.commit()
+    arts = sorted(os.listdir(workdir))
+    print("ARTIFACTS:", arts); return {"work": workdir, "artifacts": arts}
+
+
 @app.local_entrypoint()
 def main(fn: str = "pristine_run", num_acqs: int = 8):
-    table = {"pristine_run": pristine_run, "pristine_beamform": pristine_beamform}
-    print(table[fn].remote(num_acqs=num_acqs))
+    table = {"pristine_run": pristine_run, "pristine_beamform": pristine_beamform,
+             "compare_beamform": compare_beamform, "pristine_track": pristine_track}
+    print(table[fn].remote(num_acqs=num_acqs) if fn in ("pristine_run", "pristine_beamform")
+          else table[fn].remote())

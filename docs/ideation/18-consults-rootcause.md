@@ -63,8 +63,23 @@ both proposed this exact experiment as the cheapest decisive one.)
 own CLI. Findings: **the shipped `beamform_mach` holds every acq's ~11.9 GB compound in RAM
 before writing** (beamform_mach.py:119-158) → `--all-acqs` needs ~2.6 TB; even 8 acqs with
 `--spatial-tgc` OOM'd a 256 GB box at the global-TGC step (TGC runs SVD on all held
-compounds). Re-running 8 acqs without TGC to get a verbatim beamform→track→viewer result +
-an array-level beamform-exactness check vs the fork. [result appended when it lands]
+compounds). Re-running 8 acqs without TGC succeeded. **Results (verbatim their code vs our fork):**
+- **Beamform is BIT-IDENTICAL.** `compare_beamform` on acq 0: `max_abs_diff = 0.0`,
+  `bit_identical = True` (pristine `beamform_mach` vs fork `beamform_all`, same 8 acqs, no
+  TGC). Not just machine-eps — literally the same bits. The fork's `stream_accumulate`
+  reorder is a true no-op numerically. So the beamform stage IS theirs, empirically.
+- **Pristine verbatim `track` (c64, shipped recipe, 8 acqs):** 388 tracks = **48/acq**;
+  track length median 5, mean 5.5, **max 11, zero ≥35**; from **335,286 raw detections
+  (~42k/acq)** of which only 388 link → **~99.9% of shipped-c64+σ2 detections are unlinkable
+  noise.** Renders: `renders/pristine_shipped/pristine_VERBATIM_8acq_{tracks,raw_detections}.png`.
+  The raw-detection field is a grid-quantized diffuse noise cloud with faint structure.
+
+**Conclusion:** running their EXACT code reproduces exactly what our fork produces — sparse
+48/acq, 5–6-frame short tracks from a mostly-noise detection field. So the short-tracks +
+noisy-field are inherent to the shipped pipeline on this data, NOT a fork artifact, and the
+reference's continuous vessels are not what the released recipe yields. (Side note: without
+TGC the near-field band drops from ~12% to ~1.4% of detections — the skull band is
+TGC-amplified, and our earlier aggressive z<11 mm masking was partly fighting our own TGC.)
 
 ## The ask to the developers (what the release under-determines)
 
