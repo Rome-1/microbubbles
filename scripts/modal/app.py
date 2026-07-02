@@ -490,7 +490,7 @@ def consolidate(out_name: str = "baseline.h5") -> dict:
 # track — CPU. Runs the shipped tracking with the README baseline recipe to
 # produce the BASELINE tracks (+ .bin exports we pull local for viewing).
 # --------------------------------------------------------------------------- #
-@app.function(image=cpu_image, timeout=6 * 3600, memory=49152, volumes={"/root/data": vol})
+@app.function(image=cpu_image, timeout=6 * 3600, memory=98304, volumes={"/root/data": vol})
 def track(beamformed: str = "baseline.h5", frame_rate_hz: float = 222.0,
           svd_method: str = "adaptive", min_track_length: int = 5,
           tag: str = "baseline") -> dict:
