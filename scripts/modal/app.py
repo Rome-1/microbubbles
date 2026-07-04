@@ -490,6 +490,23 @@ def consolidate(out_name: str = "baseline.h5") -> dict:
 # track — CPU. Runs the shipped tracking with the README baseline recipe to
 # produce the BASELINE tracks (+ .bin exports we pull local for viewing).
 # --------------------------------------------------------------------------- #
+@app.function(image=cpu_image, timeout=1800, volumes={"/root/data": vol})
+def subset_bf(src: str = "pristine_out/beamformed.h5", dst: str = "pristine_bf_1.h5",
+              n: int = 1) -> dict:
+    """Copy the first n acquisitions (compound_image + grid) of a beamformed h5 into
+    a new file, so the fork's `track` can run on a small subset (detect-compare)."""
+    import h5py
+    vol.reload()
+    out = _guard(f"{DATA_ROOT}/{dst}")
+    with h5py.File(f"{DATA_ROOT}/{src}", "r") as s, h5py.File(out, "w") as o:
+        ids = sorted(s["acquisitions"].keys(), key=int)[:n]
+        for i, k in enumerate(ids):
+            s.copy(s[f"acquisitions/{k}"], o.require_group("acquisitions"), name=str(i))
+    vol.commit()
+    print(f"subset {n} acqs -> {out}")
+    return {"out": out, "n": n}
+
+
 @app.function(image=cpu_image, timeout=6 * 3600, memory=98304, volumes={"/root/data": vol})
 def track(beamformed: str = "baseline.h5", frame_rate_hz: float = 222.0,
           svd_method: str = "adaptive", min_track_length: int = 5,

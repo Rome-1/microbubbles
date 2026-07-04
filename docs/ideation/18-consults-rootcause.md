@@ -85,5 +85,32 @@ TGC-amplified, and our earlier aggressive z<11 mm masking was partly fighting ou
 
 Reproducing the figure hinges on: the real PRF/frame-rate, the actual clutter cutoff `low`
 per acq (non-deterministic in the released code), whether the public file is the figure's
-exact input, and which viewer + any post-processing produced the screenshot. GitHub-issue
-draft (Rome to approve before posting) lives in the session notes.
+exact input, and which viewer + any post-processing produced the screenshot.
+
+## DECISIVE: the detection stage is non-deterministic (direct measurement)
+
+Ran the fork's OWN detect path with the shipped c64 SVD (static c64 copy,
+`scripts/modal/detect_compare_app.py`) on the first n acqs of the bit-identical pristine
+beamform, and compared detections to the pristine package's:
+- **fork vs pristine ≈ fork vs itself.** Two runs of the IDENTICAL code on the SAME acq 0
+  give 39,183 and 38,282 detections; pristine gives 42,061. At voxel resolution, fork-run1 ∩
+  fork-run2 = **14%** overlap; pristine ∩ fork-run1 = **12%**. Nearest-neighbor median between
+  two same-code runs = **0.27 mm** (peaks genuinely move, not sub-pixel jitter). So the
+  fork-vs-pristine difference is no larger than the code's run-to-run noise → **no detectable
+  systematic difference; we ARE running their code.** "Bit-identical" is impossible because
+  the code doesn't reproduce itself: ~85% of detections turn over between runs.
+- **Mechanism:** `spectral_centroid_cutoff` scores modes with a phase-sensitive
+  `|rfft(u.real)|²` on the float32 covariance; the cutoff shifts run-to-run → the whole
+  ~99.9%-noise floor (only ~48 of ~42k detections/acq link) reshuffles.
+- **Implication:** exact reproduction is impossible even in principle from the released code;
+  it needs the devs to pin `--svd-n-components` / share the actual cutoff, or ship the exact
+  intermediate. This is a genuine reproducibility defect, quantified.
+
+## Issue filed (2026-07-03)
+
+Posted to the (renamed) upstream repo as Rome-1:
+**https://github.com/alephneuro/microbubbles/issues/2** — "Detection stage looks
+non-deterministic — same input, ~85% different detections between runs." Leads with the
+non-determinism + numbers; asks for the cutoff integer, the real PRF, the exact recipe/
+artifact, and which viewer. **AWAITING a maintainer reply.** Repro script (two `track` runs
+on one acq + overlap check) is ready to attach if they ask.
