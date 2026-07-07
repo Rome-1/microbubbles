@@ -12,10 +12,22 @@ sanitized HDF5 (demodulated complex IQ).
 
 ## The data (FIXED — we cannot get more)
 - One ~4-minute human scan: **223 acquisitions × ~700 frames @ 222 Hz** (demodulated complex IQ).
+  > ⚠️ **Corrected 2026-07-07 from the reference pickle + Modal `angle_probe`:** the reference
+  > pipeline used **216 acquisitions × 240 frames/acq @ 222.43 Hz** (frame rate maintainer-
+  > confirmed; physical PRF 888 Hz). Our 223×~700 is a different scope — the 240-frame window
+  > is a `frame_origin: 'selected_sequence'` subset. `num_noise_loops = 2` (702 loops → ~700).
 - Per-acq beamformed volume: **(frames=700, elev=25, z=225, x=378) complex64 ≈ 11.9 GB.**
 - Acquisition raw IQ: `(702 loops, 5 transmit angles, 1 row, 134 cols, 256 time)`.
   **Only 5 transmit angles; a 1×134 receive aperture; 25 elevation planes are SYNTHESIZED
   (not physical rows).** Single speed of sound (1600 m/s). f# 0.5, tx 2.75 MHz.
+  > ⚠️ **5-vs-4 clarified 2026-07-07 (Modal `angle_probe` on acq 0):** `tx_delays` is `[5, 134]`
+  > — all **5 slots are real steered plane-wave transmits** with near-identical energy (no
+  > junk/noise slot). Delays form a **symmetric sweep**: slot0/4 = ±steepest (1.81 µs), slot1/3
+  > = ±half (0.90 µs), **slot2 = 0° unsteered center (zero delays)**. So the data says 5, and
+  > our beamformer compounding all 5 is legitimate. The maintainer's "4 planewaves/frame"
+  > (888/222.43 = 4) **conflicts** with the released 5-slot data — open question for the PR
+  > (they may compound only 4 in production, dropping one angle). The structurally-distinct
+  > "odd one out" is slot2 (0°), but it is a valid — indeed central — imaging transmit, not junk.
 
 ## Hard constraints
 - **No ground truth.** All metrics are PROXIES (see below). Cannot claim "correct," only "better/worse on a proxy."

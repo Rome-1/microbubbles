@@ -159,6 +159,28 @@ def export_tracks_bin_v3(
     tracks = [t for t in data[key] if _track_length(t) >= min_length]
     if not tracks:
         raise SystemExit(f"No tracks with length >= {min_length} in {pickle_path}")
+    return write_tracks_bin_v3(tracks, output_path, sigma=sigma, beamformed=beamformed,
+                                svd_cutoff=svd_cutoff, data=data)
+
+
+def write_tracks_bin_v3(
+    tracks: list,
+    output_path: Path,
+    sigma: float = 10.0,
+    beamformed: Path | None = None,
+    svd_cutoff: float = 0.0,
+    data: dict | None = None,
+) -> Path:
+    """Pack an already-filtered list of track dicts into the v3 binary.
+
+    Split out of :func:`export_tracks_bin_v3` so callers that need custom
+    filtering (length + velocity-gate cutoffs, acquisition subsets, etc.)
+    can select their own ``tracks`` list without duplicating the header/
+    table/point-data packing logic. ``data`` is only consulted when
+    ``beamformed`` is given (for grid arrays + n_acquisitions).
+    """
+    if not tracks:
+        raise SystemExit("write_tracks_bin_v3: empty track list")
 
     n_tracks = len(tracks)
     total_points = sum(_track_length(t) for t in tracks)

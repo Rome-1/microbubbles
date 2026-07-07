@@ -178,6 +178,80 @@ def inspect(url: str = SAMPLE_URL, elev_planes: int = 25) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# angle_probe — CPU, ~free. Resolves the 4-vs-5 transmit-slot question from the
+# data itself: per-acq tx_delays row count (# steered angles) + per-slot raw-IQ
+# energy/correlation on acq0 to identify the odd-one-out slot. (mb: 5-vs-4)
+# --------------------------------------------------------------------------- #
+@app.function(image=cpu_image, timeout=1800, volumes={"/root/data": vol})
+def angle_probe(url: str = SAMPLE_URL, n_loops: int = 128) -> dict:
+    import json
+    import sys
+    import time
+
+    import numpy as np
+
+    sys.path.insert(0, "/workspace")
+    _ensure_root()
+    t0 = time.time()
+    h5, fobj = _open_remote_h5(url)
+    report: dict = {"url": url}
+    try:
+        acq_ids = sorted(int(k) for k in h5["acquisitions"].keys() if str(k).isdigit())
+        attrs = dict(h5["config"].attrs)
+        aid = acq_ids[0]
+        g = h5[f"acquisitions/{aid}"]
+        iq_ds = g["iq_frames"]
+        iq_shape = tuple(int(s) for s in iq_ds.shape)  # (loops, slots, rows, cols, time)
+        n_slots = int(iq_shape[1])
+
+        txd = np.asarray(g["tx_delays"], dtype=np.float64)        # (n_angles, channels)
+        txd_elev = np.asarray(g["tx_delays_elev"], dtype=np.float64)  # (n_angles, rows)
+
+        # per-slot energy + inter-slot correlation on a subset of loops
+        n_take = min(int(n_loops), iq_shape[0])
+        sub = np.asarray(iq_ds[:n_take], dtype=np.complex64)  # (n_take, slots, rows, cols, time)
+        pwr = np.abs(sub) ** 2
+        per_slot_power = [float(pwr[:, k].mean()) for k in range(n_slots)]
+        per_slot_maxamp = [float(np.abs(sub[:, k]).max()) for k in range(n_slots)]
+        flat = np.abs(sub.reshape(sub.shape[0], n_slots, -1)).mean(axis=0)  # (slots, feat)
+        corr = np.corrcoef(flat)
+
+        slot_delay = []
+        for k in range(txd.shape[0]):
+            row = txd[k]
+            slot_delay.append({
+                "min_us": float(np.min(row) * 1e6), "max_us": float(np.max(row) * 1e6),
+                "std_us": float(np.std(row) * 1e6), "allzero": bool(np.allclose(row, 0.0)),
+            })
+
+        report.update({
+            "n_acquisitions": len(acq_ids),
+            "acq0_iq_shape": iq_shape,
+            "n_transmit_slots": n_slots,
+            "tx_delays_shape": list(txd.shape),
+            "tx_delays_elev_shape": list(txd_elev.shape),
+            "n_steered_angles_from_tx_delays": int(txd.shape[0]),
+            "per_slot_mean_power": per_slot_power,
+            "per_slot_max_amp": per_slot_maxamp,
+            "per_slot_delay_stats": slot_delay,
+            "inter_slot_corr": [[round(v, 4) for v in r] for r in corr.tolist()],
+            "num_noise_loops": float(attrs.get("num_noise_loops", 0) or 0),
+            "config_keys": sorted(str(k) for k in attrs.keys()),
+            "probe_seconds": round(time.time() - t0, 1),
+        })
+    finally:
+        h5.close()
+        fobj.close()
+
+    out = _guard(f"{DATA_ROOT}/angle_probe.json")
+    with open(out, "w") as fh:
+        json.dump(report, fh, indent=2)
+    vol.commit()
+    print(json.dumps(report, indent=2))
+    return report
+
+
+# --------------------------------------------------------------------------- #
 # probe — GPU. Times one-acquisition beamform + verifies the mach kernel imports.
 # --------------------------------------------------------------------------- #
 @app.function(image=gpu_image, gpu="A10G", timeout=1800, memory=98304,
