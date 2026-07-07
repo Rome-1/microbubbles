@@ -1049,6 +1049,7 @@ def detect_acqs(url: str = SAMPLE_URL, elev_planes: int = 25, frame_rate_hz: flo
             arrays = {
                 "positions_mm": d["positions_mm"],
                 "intensities": d["intensities"],
+                "zscores": d["zscores"],
                 "frame_in_acq": d["frame_in_acq"],
                 "n_frames": d["n_frames"],
                 "src_acq_id": int(aid),
