@@ -13,7 +13,8 @@ regularizer (tractography_field.smooth_field, split-half Dice 0.60 / cos 0.85,
      axis a), so flow that runs along x smooths strongly along x and weakly
      across into elev/z — filling coverage gaps *along* vessels without bleeding
      across them. A small isotropic floor keeps gaps fillable where direction is
-     unknown. Data-fidelity term (lambda0 * count * V0) anchors confident voxels.
+     unknown. Confidence-weighted like the baseline: diffuse V*C and C on the same
+     anisotropic graph, then divide (high-count voxels dominate the smoothed field).
 
   2. INCOMPRESSIBILITY (divergence-free) RECONSTRUCTION of the weak elevation
      velocity. Blood flow is ~incompressible: div v = d_x v_x + d_y v_y + d_z v_z
@@ -141,6 +142,52 @@ def regularize(V, C, mode="graph", **kw):
     if mode == "graph+incomp":
         Vr = incompressibility_reconstruct(Vr, Cr, kappa=kw.get("kappa", 0.5))
     return Vr, Cr
+
+
+def streamlines(V, C, cthr_q=0.4, flip=0.3, step=0.6, max_steps=600, nseed=3000,
+                seed=1, min_len_mm=5.0):
+    """Integrate streamlines through the regularized field and return them as
+    mm-space polylines with per-vertex speed — for figures/exports. Mirrors
+    tractography_field.tractogram's integration (same seeds/gates), but keeps the
+    point lists instead of only occupancy. Returns list of (pts_mm Nx3, spd N)."""
+    nx, ny, nz, _ = V.shape
+    spd = np.linalg.norm(V, axis=-1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        di = (V / spd[..., None]) / SP
+        di /= (np.linalg.norm(di, axis=-1, keepdims=True) + 1e-9)
+    cthr = np.quantile(C[C > 0], cthr_q)
+
+    def look(p):
+        i, j, k = [int(round(x)) for x in p]
+        if 0 <= i < nx and 0 <= j < ny and 0 <= k < nz and C[i, j, k] >= cthr and spd[i, j, k] > 1e-6:
+            return di[i, j, k], spd[i, j, k]
+        return None, None
+
+    valid = np.argwhere((C >= cthr) & (spd > 1e-6))
+    rng = np.random.default_rng(seed)
+    valid = valid[rng.choice(len(valid), min(nseed, len(valid)), replace=False)]
+    out = []
+    for s in valid:
+        fwd, bwd = [], []
+        for sg, acc in ((1, fwd), (-1, bwd)):
+            p = s.astype(float).copy(); prev = None
+            for _ in range(max_steps):
+                d, sp = look(p)
+                if d is None:
+                    break
+                d = d * sg
+                if prev is not None and np.dot(d, prev) < flip:
+                    break
+                acc.append((ORG + p * SP, sp))
+                p = p + step * d; prev = d
+        pts = [pt for pt, _ in reversed(bwd)] + [pt for pt, _ in fwd]
+        sps = [sp for _, sp in reversed(bwd)] + [sp for _, sp in fwd]
+        if len(pts) < 2:
+            continue
+        pts = np.array(pts); arclen = np.linalg.norm(np.diff(pts, axis=0), axis=1).sum()
+        if arclen >= min_len_mm:
+            out.append((pts, np.array(sps)))
+    return out
 
 
 def split_half_validate(mids, vels, par, mode="graph", seed=1, **kw):

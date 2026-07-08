@@ -85,6 +85,14 @@ baseline, so this is head-to-head. Mean ± sd over 3 streamline-seed draws:
 Artifact: `outputs/reference/wf/r2/signal/velocity-field/splithalf_pde.json`
 (regenerate: `python scripts/wf_render_signal/tractography_pde.py`).
 
+**Figure** (`renders/pde_vs_gaussian_streamlines.png`, regen:
+`python scripts/wf_render_signal/tractography_pde_figure.py`). Side-by-side
+coronal (x–z) streamlines colored by flow speed, same seeds/gates. The isotropic
+Gaussian (left) is a tangled hairball — cross-vessel bleed produces spurious
+crossings and a 194 mm over-smoothing artifact; the graph along-vessel regularizer
+(right) traces clean, coherent laminar flow (longer *median*, 18 vs 16 mm, and no
+runaway artifact: max 71 vs 194 mm).
+
 **Reading the table.**
 - **The win is real and robust.** Anisotropic along-vessel smoothing beats the
   validated Gaussian baseline by +0.11 Dice (+17%) and +0.11 cosine (+13%), with
