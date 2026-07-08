@@ -168,6 +168,12 @@ showing the coherent flow *structure* that the reference's discrete point cloud 
    if the maintainer releases the other 215 acqs' detections, an apples-to-apples comparison.
 5. **Quantitative coverage-vs-reference** on a shared grid (the render's coverage claim vs the
    reference tracks), reported honestly against a random-split null.
+   **✓ DONE (2026-07-08, mb-ska)** — our field-tractography covers ~90% of the reference's 50,456
+   tracks (within 1 voxel), ~1.8× above a circular-shift spatial null (z 3–4): we reconstruct the
+   reference vasculature, not noise. The mb-ki9 graph field has higher *strict* recall (0.64 vs
+   0.60) but lower precision (fills beyond the reference's filtered set) — coverage matches; its
+   validated win is on the reproducibility axis (§4). See `docs/pde-field-regularization.md` §3b;
+   `scripts/wf_render_signal/coverage_vs_reference.py`.
 
 Provenance / research trail: `docs/ideation/19–24` (frontier brainstorms, the reference-gap
 root-cause, the multiplicity refutation, the tractography result). Beads: epic `mb-k25`.

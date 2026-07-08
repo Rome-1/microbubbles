@@ -119,6 +119,36 @@ genuinely 3D-resolved elevation.
 
 ---
 
+## 3b. Coverage vs the reference tracks (mb-ska)
+
+A complementary, GT-free check: does our field-tractography occupy the *same
+vasculature* the reference pipeline's 50,456 smoothed tracks do? Rasterize the
+reference tracks (504k points) and our streamline occupancy onto the shared
+coarsen-2 grid; compare against a spatial null of 200 random 3-D circular shifts
+of our occupancy (preserves our map's structure/volume, destroys its alignment
+with the reference — stricter than a uniform-random null).
+
+| field | Dice(ours,ref) | recall (·tol1) | precision (·tol1) | vs null |
+|---|---|---|---|---|
+| Gaussian baseline | 0.45 | 0.60 (0.93) | 0.36 (0.73) | 1.9× · z 4.2 |
+| graph mb-ki9 | 0.42 | **0.64** (0.91) | 0.32 (0.67) | 1.7× · z 2.9 |
+
+(`tol1` = within 1 voxel, fair to the coarse rasterization + localization slop.)
+Artifact: `outputs/.../velocity-field/coverage_vs_reference.json`
+(`python scripts/wf_render_signal/coverage_vs_reference.py`).
+
+- **We reconstruct the reference vasculature, not noise.** Both fields cover ~90%
+  of the reference tracks within one voxel, at ~1.8× a spatial null (z 3–4) — our
+  streamlines land where the reference's bubbles actually went.
+- **Honest trade.** The mb-ki9 graph field has *higher strict recall* (0.64 vs 0.60
+  — recovers more reference vessels exactly) but *lower precision* (it fills more
+  coverage, some beyond the reference's length-filtered set), so raw Dice-vs-this-
+  reference is ≈ flat. Coverage-vs-one-reference and split-half reproducibility are
+  **different axes**: the graph field's decisive, separately-validated win is
+  reproducibility (§3, Dice 0.61→0.71), while it *matches* the reference on coverage.
+  Precision-vs-reference is itself confounded (the reference is one specific filtered
+  pipeline and the grid includes non-tissue space), so recall is the cleaner direction.
+
 ## 4. Why this is the right next step
 
 - **Physically principled.** Vessels are the flow's own coherence direction; diffusing
