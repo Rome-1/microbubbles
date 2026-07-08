@@ -156,6 +156,11 @@ showing the coherent flow *structure* that the reference's discrete point cloud 
    method `scripts/wf_render_signal/tractography_pde.py`.
 2. **Composite render**: tractography vessels + flow-*direction* hue + artery/vein two-tone +
    perfusion/flux channel — structure *and* the science readouts the blog lacks.
+   **✓ DONE (2026-07-08, mb-4k2)** — 4-panel science composite on the graph-regularized field:
+   (A) structure+speed, (B) DTI-style flow-direction RGB, (C) validated antiparallel artery/vein
+   pairs, (D) perfusion/flux throughput. Fleet-safe matplotlib (no chrome).
+   `renders/composite_science.png`; method `scripts/wf_render_signal/composite_render.py`.
+   (The polished *hero* aesthetic render remains mb-hi8.)
 3. **Hero render capture + selection**: validate the untested ribbon-quad "living-angiogram"
    shader on a cool box; pick line-viewer vs hero; tune streamline density and (Line2) vessel
    width to match/beat the blog's crispness.
