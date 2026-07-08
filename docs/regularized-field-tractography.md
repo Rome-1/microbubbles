@@ -148,6 +148,12 @@ showing the coherent flow *structure* that the reference's discrete point cloud 
    a graph-Laplacian low-pass, and enforce incompressibility `∂_z v_z = −(∂_x v_x + ∂_y v_y)` to
    reconstruct the weak (synthesized) elevation velocity — longer, higher-reproducibility,
    physically-constrained vessels.
+   **✓ DONE (2026-07-08, mb-ki9)** — the along-vessel graph-Laplacian regularizer raises
+   split-half reproducibility from Dice 0.61 / cos 0.84 to **Dice 0.71 / cos 0.95** (+17% / +13%,
+   seed-robust); a matched-diffusivity isotropic control collapses (Dice 0.07, cos ≈ 0), proving
+   the gain is anisotropy, not more smoothing. Incompressibility was neutral on this coarse
+   elevation axis (honest finding). See `docs/pde-field-regularization.md`;
+   method `scripts/wf_render_signal/tractography_pde.py`.
 2. **Composite render**: tractography vessels + flow-*direction* hue + artery/vein two-tone +
    perfusion/flux channel — structure *and* the science readouts the blog lacks.
 3. **Hero render capture + selection**: validate the untested ribbon-quad "living-angiogram"
