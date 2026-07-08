@@ -23,3 +23,6 @@ state.json
 
 # Beads Dolt working dir (synced via bd sync, not git)
 .beads/
+
+# diff-viewer regenerable data (regen: export_diff_viewer.py)
+scripts/wf_render_signal/diff_viewer/data/

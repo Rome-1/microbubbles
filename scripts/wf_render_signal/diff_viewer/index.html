@@ -1,0 +1,366 @@
+<meta charset="utf-8" />
+<title>3D-ULM strategy-diff viewer</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #000; overflow: hidden;
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif; color: #ddd; }
+  #app { position: fixed; inset: 0; }
+  canvas { display: block; }
+  .hud { position: fixed; pointer-events: none; z-index: 5; text-shadow: 0 1px 3px #000; }
+  #legend { top: 12px; left: 290px; font-size: 12px; line-height: 1.5; max-width: 360px; }
+  #legend b { color: #fff; } #legend .sw { display: inline-block; width: 11px; height: 11px;
+    border-radius: 2px; vertical-align: -1px; margin-right: 5px; }
+  #legend .badge { color: #9fe; font-variant-numeric: tabular-nums; }
+  #banner { bottom: 10px; left: 14px; font-size: 10.5px; color: #8a8a8a; max-width: 60ch; line-height: 1.45; }
+  #cbar { top: 12px; right: 14px; width: 20px; height: 190px; border: 1px solid #333;
+    background: linear-gradient(to top, #00007f,#0000ff,#0080ff,#00ffff,#80ff80,#ffff00,#ff8000,#ff0000,#7f0000); }
+  #cbarwrap { top: 12px; right: 40px; font-size: 10px; text-align: right; }
+  #scalebar { bottom: 16px; right: 16px; text-align: center; font-size: 10.5px; }
+  #scalebar .bar { height: 3px; background: #fff; margin-top: 3px; }
+  #loading { top: 50%; left: 50%; transform: translate(-50%,-50%); font-size: 14px; color: #888;
+    pointer-events: none; }
+</style>
+<div id="app"></div>
+<div class="hud" id="legend"></div>
+<div class="hud" id="banner"></div>
+<div class="hud" id="cbarwrap"><span id="cbmax">38</span><br><br><br><br><br><br><br><br><span id="cbmid">19</span><br><br><br><br><br><br><br><br><span id="cbmin">0</span></div>
+<div class="hud" id="cbar"></div>
+<div class="hud" id="scalebar"><span id="sblabel">10 mm</span><div class="bar" id="sbbar" style="width:80px"></div></div>
+<div class="hud" id="loading">loading…</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "./vendor/three/build/three.module.js",
+  "three/addons/": "./vendor/three/examples/jsm/",
+  "lil-gui": "./vendor/lil-gui.esm.min.js"
+} }
+</script>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import GUI from "lil-gui";
+
+// ---------- binary loaders ----------
+const LINES_MAGIC = 0x554c4d54, GRID_MAGIC = 0x554c4d47;
+async function ab(url){ const r = await fetch(url); if(!r.ok) throw new Error(url+" "+r.status); return r.arrayBuffer(); }
+
+function parseLines(buf){
+  const dv = new DataView(buf);
+  if(dv.getUint32(0,true)!==LINES_MAGIC) throw new Error("bad lines magic");
+  const nTracks=dv.getUint32(8,true), totalPoints=dv.getUint32(12,true), maxSpeed=dv.getFloat32(16,true);
+  const bmin=[dv.getFloat32(20,true),dv.getFloat32(24,true),dv.getFloat32(28,true)];
+  const bmax=[dv.getFloat32(32,true),dv.getFloat32(36,true),dv.getFloat32(40,true)];
+  let o=64;
+  const offsets=new Uint32Array(nTracks), lengths=new Uint32Array(nTracks);
+  for(let i=0;i<nTracks;i++){ offsets[i]=dv.getUint32(o,true); lengths[i]=dv.getUint32(o+4,true); o+=8; }
+  const pts=new Float32Array(buf, o, totalPoints*8);   // [x,y,z,spd,dx,dy,dz,conf]
+  return { nTracks, totalPoints, maxSpeed, bmin, bmax, offsets, lengths, pts };
+}
+function parseGrid(buf){
+  const dv=new DataView(buf);
+  if(dv.getUint32(0,true)!==GRID_MAGIC) throw new Error("bad grid magic");
+  const nx=dv.getUint32(8,true), ny=dv.getUint32(12,true), nz=dv.getUint32(16,true), nv=nx*ny*nz;
+  let o=64;
+  const occ=new Uint8Array(buf.slice(o,o+nv)); o+=nv;                 // slice => 4-byte aligned copies
+  const dir=new Float32Array(buf.slice(o,o+nv*12)); o+=nv*12;
+  const speed=new Float32Array(buf.slice(o,o+nv*4)); o+=nv*4;
+  const conf=new Float32Array(buf.slice(o,o+nv*4));
+  return { nx, ny, nz, occ, dir, speed, conf };
+}
+function parseAV(buf){
+  const dv=new DataView(buf);
+  const nx=dv.getUint32(8,true), ny=dv.getUint32(12,true), nz=dv.getUint32(16,true);
+  return { nx, ny, nz, lbl: new Uint8Array(buf.slice(64,64+nx*ny*nz)) };
+}
+
+// ---------- colormaps ----------
+function jet(t){ t=Math.min(1,Math.max(0,t)); // returns [r,g,b] 0..1
+  const r=Math.min(Math.max(1.5-Math.abs(4*t-3),0),1), g=Math.min(Math.max(1.5-Math.abs(4*t-2),0),1),
+        b=Math.min(Math.max(1.5-Math.abs(4*t-1),0),1); return [r,g,b]; }
+function hex2rgb(h){ h=h.replace('#',''); return [parseInt(h.slice(0,2),16)/255, parseInt(h.slice(2,4),16)/255, parseInt(h.slice(4,6),16)/255]; }
+
+// ---------- globals ----------
+let GS, SP, ORG, FRAME_HZ, SPD_MAX, manifest, AV=null;
+const strat = {};                 // id -> { meta, lines, grid, obj(LineSegments), cumlen[], particles{} }
+let renderer, scene, camera, controls, gui, clipPlane;
+const state = { A:"graph", B:"gauss", view:"Overlay + diff", science:"speed", confOpacity:true,
+  play:true, speed:1.0, density:7000, blinkRate:1.5, lineWidth:1, clipEnable:false, clipAxis:"z", clipPos:0.5,
+  pulsatility:false };
+let clock, blinkT=0, blinkShowA=true;
+
+function voxLin(x,y,z){
+  const ix=Math.floor((x-ORG[0])/SP[0]), iy=Math.floor((y-ORG[1])/SP[1]), iz=Math.floor((z-ORG[2])/SP[2]);
+  if(ix<0||ix>=GS[0]||iy<0||iy>=GS[1]||iz<0||iz>=GS[2]) return -1;
+  return (ix*GS[1]+iy)*GS[2]+iz;
+}
+
+// ---------- line object + coloring ----------
+const lineVert = `attribute vec3 aColor; attribute float aAlpha; varying vec3 vC; varying float vA;
+  void main(){ vC=aColor; vA=aAlpha; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`;
+const lineFrag = `varying vec3 vC; varying float vA; void main(){ if(vA<=0.004) discard; gl_FragColor=vec4(vC,vA); }`;
+
+function buildLineObject(s){
+  const L=s.lines, pos=new Float32Array(L.totalPoints*3);
+  for(let p=0;p<L.totalPoints;p++){ pos[p*3]=L.pts[p*8]; pos[p*3+1]=L.pts[p*8+1]; pos[p*3+2]=L.pts[p*8+2]; }
+  const nSeg=L.totalPoints-L.nTracks, index=new Uint32Array(nSeg*2); let si=0;
+  for(let t=0;t<L.nTracks;t++){ const off=L.offsets[t], len=L.lengths[t];
+    for(let k=0;k<len-1;k++){ index[si++]=off+k; index[si++]=off+k+1; } }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(pos,3));
+  g.setAttribute("aColor", new THREE.BufferAttribute(new Float32Array(L.totalPoints*3),3));
+  g.setAttribute("aAlpha", new THREE.BufferAttribute(new Float32Array(L.totalPoints),1));
+  g.setIndex(new THREE.BufferAttribute(index,1));
+  const m=new THREE.ShaderMaterial({ vertexShader:lineVert, fragmentShader:lineFrag,
+    transparent:true, depthWrite:false, blending:THREE.AdditiveBlending });
+  return new THREE.LineSegments(g,m);
+}
+
+// color a strategy's line vertices. mode: 'science' uses state.science; 'diffA'/'diffB' provenance vs other grid
+function colorLines(s, mode, otherGrid){
+  const L=s.lines, col=s.obj.geometry.getAttribute("aColor"), al=s.obj.geometry.getAttribute("aAlpha");
+  const hue = hex2rgb(s.meta.diff_hue), shared=[0.91,0.91,0.91];
+  for(let p=0;p<L.totalPoints;p++){
+    const b=p*8, x=L.pts[b],y=L.pts[b+1],z=L.pts[b+2], spd=L.pts[b+3], conf=L.pts[b+7];
+    let c;
+    if(mode==="diffA"||mode==="diffB"){
+      const vl=voxLin(x,y,z); const inOther = vl>=0 && otherGrid.occ[vl]>0;
+      c = inOther ? shared : hue;
+    } else if(state.science==="direction"){
+      c=[Math.abs(L.pts[b+4]),Math.abs(L.pts[b+5]),Math.abs(L.pts[b+6])];
+    } else if(state.science==="artery-vein" && AV){
+      const vl=voxLin(x,y,z), lab= vl>=0?AV.lbl[vl]:0;
+      c = lab===1?[1,0.22,0.22] : lab===2?[0.23,0.63,1] : [0.42,0.42,0.42];
+    } else { // speed jet, fixed 0..SPD_MAX mm/s
+      c=jet((spd*FRAME_HZ)/SPD_MAX);
+    }
+    col.array[p*3]=c[0]; col.array[p*3+1]=c[1]; col.array[p*3+2]=c[2];
+    let a = state.confOpacity ? (0.12+0.88*conf) : 0.85;
+    if(mode==="diffA"||mode==="diffB"){ const vl=voxLin(x,y,z); const inOther=vl>=0&&otherGrid.occ[vl]>0;
+      a *= inOther?0.28:0.95; }               // shared quiet, only-X loud
+    al.array[p]=a;
+  }
+  col.needsUpdate=true; al.needsUpdate=true;
+}
+
+// ---------- particles ----------
+const pVert=`attribute vec3 aColor; attribute float aAlpha; attribute float aSize; varying vec3 vC; varying float vA;
+  void main(){ vC=aColor; vA=aAlpha; vec4 mv=modelViewMatrix*vec4(position,1.0);
+  gl_PointSize=aSize*(300.0/-mv.z); gl_Position=projectionMatrix*mv; }`;
+const pFrag=`varying vec3 vC; varying float vA; void main(){ vec2 d=gl_PointCoord-vec2(0.5);
+  float r=length(d); if(r>0.5||vA<=0.01) discard; float g=smoothstep(0.5,0.0,r);
+  gl_FragColor=vec4(vC, vA*g); }`;
+
+function buildParticles(s){
+  const N=Math.min(state.density, 16000);
+  // seed proportional to track length
+  const L=s.lines, tl=[]; let tot=0;
+  for(let t=0;t<L.nTracks;t++){ const len=s.cumlen[t][L.lengths[t]-1]||0.001; tl.push(len); tot+=len; }
+  const part=[]; for(let i=0;i<N;i++){ // pick track by length-weighted
+    let r=Math.random()*tot, t=0; while(t<L.nTracks-1 && r>tl[t]){ r-=tl[t]; t++; }
+    part.push({ t, s: Math.random()*tl[t], k:0 }); }
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(N*3),3));
+  geo.setAttribute("aColor", new THREE.BufferAttribute(new Float32Array(N*3),3));
+  geo.setAttribute("aAlpha", new THREE.BufferAttribute(new Float32Array(N),1));
+  geo.setAttribute("aSize", new THREE.BufferAttribute(new Float32Array(N).fill(2.4),1));
+  const mat=new THREE.ShaderMaterial({ vertexShader:pVert, fragmentShader:pFrag, transparent:true,
+    depthWrite:false, blending:THREE.AdditiveBlending });
+  s.particles={ obj:new THREE.Points(geo,mat), part, N };
+}
+
+function advance(s, dt, mode, otherGrid){
+  const P=s.particles; if(!P) return;
+  const L=s.lines, pos=P.obj.geometry.getAttribute("position"), col=P.obj.geometry.getAttribute("aColor"),
+        al=P.obj.geometry.getAttribute("aAlpha");
+  const hue=hex2rgb(s.meta.diff_hue), pulse = state.pulsatility ? (1+0.5*Math.sin(clock.elapsedTime*6.0)) : 1;
+  for(let i=0;i<P.part.length;i++){
+    const pt=P.part[i], t=pt.t, off=L.offsets[t], len=L.lengths[t], cl=s.cumlen[t], total=cl[len-1]||0.001;
+    // local speed at current s
+    let k=pt.k; if(k>=len-1) k=0; while(k<len-1 && cl[k+1]<pt.s) k++; while(k>0 && cl[k]>pt.s) k--;
+    pt.k=k;
+    const spd=L.pts[(off+k)*8+3];
+    pt.s += spd*FRAME_HZ*dt*state.speed*0.02*pulse;            // advect at physical speed (scaled to view)
+    let fade=1;
+    if(pt.s>=total){ pt.s-=total; }
+    if(pt.s< total*0.04) fade=pt.s/(total*0.04+1e-6);          // fade-in near wrap
+    else if(pt.s> total*0.96) fade=(total-pt.s)/(total*0.04+1e-6);
+    // recompute k after wrap
+    k=pt.k; if(k>=len-1||cl[k]>pt.s) k=0; while(k<len-1 && cl[k+1]<pt.s) k++;
+    const frac=(pt.s-cl[k])/((cl[k+1]-cl[k])||1e-6);
+    const a=(off+k)*8, bIdx=(off+Math.min(k+1,len-1))*8;
+    const x=L.pts[a]+(L.pts[bIdx]-L.pts[a])*frac, y=L.pts[a+1]+(L.pts[bIdx+1]-L.pts[a+1])*frac,
+          z=L.pts[a+2]+(L.pts[bIdx+2]-L.pts[a+2])*frac;
+    pos.array[i*3]=x; pos.array[i*3+1]=y; pos.array[i*3+2]=z;
+    let c, alpha=fade;
+    if(mode==="diffA"||mode==="diffB"){ const vl=voxLin(x,y,z), inOther= vl>=0 && otherGrid.occ[vl]>0;
+      c = inOther?[0.9,0.9,0.9]:hue; alpha *= inOther?0.35:1.0; }
+    else if(state.science==="direction"){ c=[Math.abs(L.pts[a+4]),Math.abs(L.pts[a+5]),Math.abs(L.pts[a+6])]; }
+    else if(state.science==="artery-vein" && AV){ const vl=voxLin(x,y,z), lab=vl>=0?AV.lbl[vl]:0;
+      c= lab===1?[1,0.22,0.22]:lab===2?[0.23,0.63,1]:[0.5,0.5,0.5]; }
+    else c=jet((L.pts[a+3]*FRAME_HZ)/SPD_MAX);
+    col.array[i*3]=c[0]; col.array[i*3+1]=c[1]; col.array[i*3+2]=c[2]; al.array[i]=alpha;
+  }
+  pos.needsUpdate=true; col.needsUpdate=true; al.needsUpdate=true;
+}
+
+// ---------- scene ----------
+function initScene(){
+  const app=document.getElementById("app");
+  renderer=new THREE.WebGLRenderer({ antialias:true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio,2)); renderer.setSize(innerWidth, innerHeight);
+  renderer.localClippingEnabled=true; app.appendChild(renderer.domElement);
+  scene=new THREE.Scene(); scene.background=new THREE.Color(0x000000);
+  const cx=ORG[0]+GS[0]*SP[0]/2, cy=ORG[1]+GS[1]*SP[1]/2, cz=ORG[2]+GS[2]*SP[2]/2;
+  const diag=Math.hypot(GS[0]*SP[0], GS[1]*SP[1], GS[2]*SP[2]);
+  scene.fog=new THREE.Fog(0x000000, diag*0.6, diag*2.2);
+  camera=new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.1, diag*10); camera.up.set(0,0,1);
+  camera.position.set(cx, cy-diag*1.25, cz+diag*0.15);
+  controls=new OrbitControls(camera, renderer.domElement); controls.enableDamping=true;
+  controls.target.set(cx,cy,cz); controls.update();
+  clipPlane=new THREE.Plane(new THREE.Vector3(0,0,-1), 0);
+  addEventListener("resize", ()=>{ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth,innerHeight); });
+  addEventListener("keydown", e=>{ if(e.code==="Space"){ e.preventDefault();
+    if(state.view==="Blink"){ blinkShowA=!blinkShowA; } else { state.play=!state.play; } } });
+}
+
+function cumlenFor(s){
+  const L=s.lines, arr=[];
+  for(let t=0;t<L.nTracks;t++){ const off=L.offsets[t], len=L.lengths[t], cl=new Float32Array(len); cl[0]=0;
+    for(let k=1;k<len;k++){ const a=(off+k-1)*8,b=(off+k)*8;
+      cl[k]=cl[k-1]+Math.hypot(L.pts[b]-L.pts[a],L.pts[b+1]-L.pts[a+1],L.pts[b+2]-L.pts[a+2]); }
+    arr.push(cl); }
+  s.cumlen=arr;
+}
+
+// ---------- HUD ----------
+function updateHUD(){
+  const A=strat[state.A].meta, B=strat[state.B].meta, diff = state.view==="Overlay + diff"||state.view==="Blink"||state.view==="Wipe"||state.view==="Side-by-side";
+  const met=m=>`Dice ${m.splithalf_dice??"—"} · cos ${m.direction_cosine??"—"}`;
+  let h="";
+  if(diff){
+    h+=`<b>A</b> <span class="sw" style="background:${A.diff_hue}"></span>${A.label} <span class="badge">${met(A.metrics)}</span><br>`;
+    h+=`<b>B</b> <span class="sw" style="background:${B.diff_hue}"></span>${B.label} <span class="badge">${met(B.metrics)}</span><br>`;
+    h+=`<span class="sw" style="background:#e8e8e8"></span>shared &nbsp; <span class="sw" style="background:${A.diff_hue}"></span>A-only &nbsp; <span class="sw" style="background:${B.diff_hue}"></span>B-only`;
+  } else {
+    const s = state.view==="Single B" ? B : A;
+    h+=`<b>${s.label}</b> <span class="badge">${met(s.metrics)}</span><br>channel: <b>${state.science}</b>`;
+  }
+  document.getElementById("legend").innerHTML=h;
+  document.getElementById("cbar").style.display = (!diff && state.science==="speed") ? "block":"none";
+  document.getElementById("cbarwrap").style.display = document.getElementById("cbar").style.display;
+  document.getElementById("banner").innerHTML = manifest.honesty_notes.map(n=>"• "+n).join("<br>");
+}
+function updateScaleBar(){
+  const cx=ORG[0]+GS[0]*SP[0]/2, cy=ORG[1]+GS[1]*SP[1]/2, cz=ORG[2]+GS[2]*SP[2]/2;
+  const d=camera.position.distanceTo(new THREE.Vector3(cx,cy,cz));
+  const worldPerPx = 2*Math.tan((camera.fov*Math.PI/180)/2)*d/innerHeight;
+  const px=10/worldPerPx; document.getElementById("sbbar").style.width=Math.max(8,Math.min(300,px))+"px";
+}
+
+// ---------- render loop ----------
+function setVisibility(){
+  for(const id in strat){ strat[id].obj.visible=false; if(strat[id].particles) strat[id].particles.obj.visible=false; }
+  const A=strat[state.A], B=strat[state.B];
+  const showA=()=>{A.obj.visible=true; if(A.particles)A.particles.obj.visible=true;};
+  const showB=()=>{B.obj.visible=true; if(B.particles)B.particles.obj.visible=true;};
+  if(state.view==="Single A") showA();
+  else if(state.view==="Single B") showB();
+  else if(state.view==="Blink"){ blinkShowA?showA():showB(); }
+  else { showA(); showB(); }        // Overlay+diff, Wipe, Side-by-side
+}
+function applyClip(){
+  const A=strat[state.A], B=strat[state.B];
+  const useClip = state.view==="Wipe";
+  const ax = state.clipAxis==="x"?0:state.clipAxis==="y"?1:2;
+  const nrm=new THREE.Vector3(); nrm.setComponent(ax, 1);
+  const lo=ORG[ax], hi=ORG[ax]+GS[ax]*SP[ax], cut=lo+(hi-lo)*state.clipPos;
+  const pA=new THREE.Plane(nrm.clone(), -cut), pB=new THREE.Plane(nrm.clone().negate(), cut);
+  A.obj.material.clippingPlanes = useClip?[pA]:null;
+  B.obj.material.clippingPlanes = useClip?[pB]:null;
+}
+function recolor(){
+  const A=strat[state.A], B=strat[state.B];
+  if(state.view==="Overlay + diff"||state.view==="Wipe"||state.view==="Side-by-side"){
+    colorLines(A,"diffA",B.grid); colorLines(B,"diffB",A.grid);
+  } else if(state.view==="Blink"){ colorLines(A,"diffA",B.grid); colorLines(B,"diffB",A.grid); }
+  else { colorLines(state.view==="Single B"?B:A,"science",null); }
+}
+function renderSideBySide(){
+  const w=innerWidth, h=innerHeight, A=strat[state.A], B=strat[state.B];
+  renderer.setScissorTest(true);
+  A.obj.visible=true; if(A.particles)A.particles.obj.visible=true; B.obj.visible=false; if(B.particles)B.particles.obj.visible=false;
+  renderer.setViewport(0,0,w/2,h); renderer.setScissor(0,0,w/2,h); camera.aspect=(w/2)/h; camera.updateProjectionMatrix(); renderer.render(scene,camera);
+  A.obj.visible=false; if(A.particles)A.particles.obj.visible=false; B.obj.visible=true; if(B.particles)B.particles.obj.visible=true;
+  renderer.setViewport(w/2,0,w/2,h); renderer.setScissor(w/2,0,w/2,h); renderer.render(scene,camera);
+  renderer.setScissorTest(false); renderer.setViewport(0,0,w,h); camera.aspect=w/h; camera.updateProjectionMatrix();
+}
+function loop(){
+  requestAnimationFrame(loop);
+  const dt=Math.min(clock.getDelta(),0.05);
+  controls.update();
+  if(state.view==="Blink"){ blinkT+=dt; if(blinkT>1/state.blinkRate){ blinkT=0; blinkShowA=!blinkShowA; } }
+  const A=strat[state.A], B=strat[state.B], diff=(state.view!=="Single A"&&state.view!=="Single B"&&state.view!=="Blink");
+  if(state.play){
+    if(state.view==="Single A"||state.view==="Blink") advance(A,dt,"science",null);
+    else if(state.view==="Single B") advance(B,dt,"science",null);
+    else { advance(A,dt,"diffA",B.grid); advance(B,dt,"diffB",A.grid); }
+  }
+  scene.fog.far = (state.view==="Blink")? 1e6 : Math.hypot(GS[0]*SP[0],GS[1]*SP[1],GS[2]*SP[2])*2.2;
+  updateScaleBar();
+  if(state.view==="Side-by-side"){ renderSideBySide(); }
+  else { setVisibility(); renderer.render(scene,camera); }
+}
+
+// ---------- GUI ----------
+function buildGUI(){
+  gui=new GUI({ title:"strategy diff" }); gui.domElement.style.left="10px"; gui.domElement.style.right="auto";
+  const ids=manifest.strategies.map(s=>s.id);
+  const onChange=()=>{ setVisibility(); applyClip(); recolor(); updateHUD(); };
+  gui.add(state,"A",ids).name("strategy A").onChange(onChange);
+  gui.add(state,"B",ids).name("strategy B").onChange(onChange);
+  gui.add(state,"view",["Single A","Single B","Overlay + diff","Blink","Wipe","Side-by-side"]).name("view").onChange(onChange);
+  gui.add(state,"science",["speed","direction","artery-vein"]).name("science channel").onChange(onChange);
+  gui.add(state,"confOpacity").name("confidence opacity").onChange(recolor);
+  const tf=gui.addFolder("time");
+  tf.add(state,"play").name("play").listen(); tf.add(state,"speed",0.1,5,0.1).name("flow speed");
+  tf.add(state,"density",500,16000,500).name("particle density").onFinishChange(()=>{ rebuildParticles(); });
+  tf.add(state,"pulsatility").name("pulsatility (illustrative)");
+  const df=gui.addFolder("diff / clip");
+  df.add(state,"blinkRate",0.5,5,0.5).name("blink rate (Hz)");
+  df.add(state,"clipAxis",["x","y","z"]).name("wipe axis").onChange(applyClip);
+  df.add(state,"clipPos",0,1,0.01).name("wipe position").onChange(applyClip);
+  const cf=gui.addFolder("camera");
+  cf.add({reset:()=>{ const cx=ORG[0]+GS[0]*SP[0]/2,cy=ORG[1]+GS[1]*SP[1]/2,cz=ORG[2]+GS[2]*SP[2]/2,
+    diag=Math.hypot(GS[0]*SP[0],GS[1]*SP[1],GS[2]*SP[2]); camera.position.set(cx,cy-diag*1.25,cz+diag*0.15);
+    controls.target.set(cx,cy,cz); controls.update(); }},"reset").name("reset camera");
+  cf.add({shot:()=>{ renderer.render(scene,camera); const a=document.createElement("a");
+    a.download="diff_viewer.png"; a.href=renderer.domElement.toDataURL(); a.click(); }},"shot").name("screenshot");
+}
+function rebuildParticles(){ for(const id in strat){ if(strat[id].particles){ scene.remove(strat[id].particles.obj); }
+  buildParticles(strat[id]); scene.add(strat[id].particles.obj); } setVisibility(); }
+
+// ---------- boot ----------
+(async function(){
+  try{
+    manifest=await (await fetch("data/manifest.json")).json();
+    GS=manifest.grid.shape; SP=manifest.grid.spacing_mm; ORG=manifest.grid.origin_mm;
+    FRAME_HZ=manifest.frame_rate_hz; SPD_MAX=manifest.speed_scale_max_mm_s;
+    if(manifest.av_grid){ try{ AV=parseAV(await ab("data/"+manifest.av_grid)); }catch(e){ console.warn("no AV",e);} }
+    for(const m of manifest.strategies){
+      const lines=parseLines(await ab("data/"+m.lines)), grid=parseGrid(await ab("data/"+m.grid));
+      const s={ meta:m, lines, grid }; strat[m.id]=s;
+      cumlenFor(s); s.obj=buildLineObject(s); buildParticles(s);
+      console.log(`${m.id}: ${lines.nTracks} tracks, ${lines.totalPoints} pts, bounds`, lines.bmin, lines.bmax);
+    }
+    initScene();
+    for(const id in strat){ scene.add(strat[id].obj); scene.add(strat[id].particles.obj); }
+    buildGUI(); clock=new THREE.Clock();
+    setVisibility(); applyClip(); recolor(); updateHUD();
+    document.getElementById("loading").style.display="none";
+    loop();
+  }catch(e){ document.getElementById("loading").innerHTML="error: "+e.message; console.error(e); }
+})();
+</script>
