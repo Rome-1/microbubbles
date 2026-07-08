@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Brane — tractography LINE viewer (jet, flow speed 0-38 mm/s)</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body { overflow: hidden; background: #000; }
+      canvas { display: block; }
+      #info {
+        position: absolute;
+        bottom: 12px;
+        left: 12px;
+        color: rgba(255,255,255,0.5);
+        font: 12px/1.4 monospace;
+        pointer-events: none;
+        user-select: none;
+      }
+      /* Blog-style flow-speed legend, top-right: jet gradient bar + 0/19/38 mm/s ticks. */
+      #legend {
+        position: absolute;
+        top: 20px;
+        right: 24px;
+        display: flex;
+        align-items: stretch;
+        gap: 10px;
+        color: rgba(255,255,255,0.75);
+        font: 12px/1 monospace;
+        pointer-events: none;
+        user-select: none;
+      }
+      #legend .bar {
+        width: 12px;
+        height: 190px;
+        border-radius: 2px;
+        background: linear-gradient(to top,
+          rgb(26,51,204) 0%,
+          rgb(0,179,230) 25%,
+          rgb(26,230,51) 50%,
+          rgb(242,217,26) 75%,
+          rgb(230,26,26) 100%);
+      }
+      #legend .ticks {
+        height: 190px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+      }
+      #legend .title {
+        writing-mode: vertical-rl;
+        transform: rotate(180deg);
+        letter-spacing: 0.05em;
+        color: rgba(255,255,255,0.55);
+      }
+      /* Blog-style 10 mm scale bar, bottom-right, width tracks zoom live. */
+      #scalebar {
+        position: absolute;
+        bottom: 28px;
+        right: 24px;
+        text-align: center;
+        color: rgba(255,255,255,0.75);
+        font: 12px/1 monospace;
+        pointer-events: none;
+        user-select: none;
+      }
+      #scalebar .bar {
+        height: 3px;
+        background: #fff;
+        margin-bottom: 6px;
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./vendor/three/build/three.module.js",
+          "three/addons/": "./vendor/three/examples/jsm/",
+          "lil-gui": "./vendor/lil-gui.esm.min.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="info">Brane</div>
+    <div id="legend">
+      <div class="bar"></div>
+    </div>
+    <div id="scalebar"><div class="bar" id="scalebar-bar" style="width:0px"></div>10 mm</div>
+    <script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+import GUI from "lil-gui";
+
+// ============================================================
+// Blog-match constants
+// ============================================================
+// The Aleph blog's "flow speed" legend is FIXED 0-38 mm/s (jet), not an
+// auto-scaled per-render max. Frame rate 222.43 Hz comes from the reference
+// pipeline params (docs/ideation/20-reference-artifacts-received.md).
+const FRAME_RATE_HZ = 222.43;
+const SPEED_SCALE_MAX_MM_S = 38.0;
+
+// ============================================================
+// Jet colormap (CPU-side; must match the #legend gradient stops exactly)
+// ============================================================
+function cmapJet(t) {
+  t = Math.min(Math.max(t, 0.0), 1.0);
+  if (t < 0.25) return lerp3([0.1, 0.2, 0.8], [0.0, 0.7, 0.9], t / 0.25);
+  if (t < 0.5)  return lerp3([0.0, 0.7, 0.9], [0.1, 0.9, 0.2], (t - 0.25) / 0.25);
+  if (t < 0.75) return lerp3([0.1, 0.9, 0.2], [0.95, 0.85, 0.1], (t - 0.5) / 0.25);
+  return lerp3([0.95, 0.85, 0.1], [0.9, 0.1, 0.1], (t - 0.75) / 0.25);
+}
+function lerp3(a, b, f) {
+  return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+}
+
+// ============================================================
+// TrackLoader
+// ============================================================
+
+const MAGIC = 0x554c4d54;
+
+async function loadTracks(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Failed to load ${url}: ${response.status}`);
+  const buffer = await response.arrayBuffer();
+
+  const headerView = new DataView(buffer, 0, 64);
+  const magic = headerView.getUint32(0, true);
+  if (magic !== MAGIC) throw new Error(`Bad magic: 0x${magic.toString(16)}`);
+
+  const version = headerView.getUint32(4, true);
+  if (version !== 2 && version !== 3) throw new Error(`Unsupported version: ${version}`);
+
+  const floatsPerPoint = version >= 3 ? 6 : 5;
+  const nTracks = headerView.getUint32(8, true);
+  const totalPoints = headerView.getUint32(12, true);
+  const maxSpeed = headerView.getFloat32(16, true);
+
+  const boundsMin = [
+    headerView.getFloat32(20, true),
+    headerView.getFloat32(24, true),
+    headerView.getFloat32(28, true),
+  ];
+  const boundsMax = [
+    headerView.getFloat32(32, true),
+    headerView.getFloat32(36, true),
+    headerView.getFloat32(40, true),
+  ];
+
+  const tableOffset = 64;
+  const tableView = new DataView(buffer, tableOffset, nTracks * 8);
+  const tracks = new Array(nTracks);
+  for (let i = 0; i < nTracks; i++) {
+    tracks[i] = {
+      pointOffset: tableView.getUint32(i * 8, true),
+      length: tableView.getUint32(i * 8 + 4, true),
+    };
+  }
+
+  const pointDataOffset = tableOffset + nTracks * 8;
+  const pointData = new Float32Array(buffer, pointDataOffset, totalPoints * floatsPerPoint);
+
+  return { nTracks, totalPoints, maxSpeed, boundsMin, boundsMax, tracks, pointData, floatsPerPoint };
+}
+
+// ============================================================
+// LineTrackSystem — each streamline becomes a run of independent GL_LINES
+// segments (never a single LINE_STRIP across tracks, so consecutive
+// streamlines never get spuriously connected). Color is per-vertex jet,
+// fixed 0-38 mm/s scale, matching the blog + point-cloud blog-match viewer.
+// ============================================================
+
+class LineTrackSystem {
+  constructor(trackData, opts) {
+    const { nTracks, tracks, totalPoints, pointData } = trackData;
+    const fpp = trackData.floatsPerPoint || 6;
+
+    // Count segments: each track of length L contributes (L-1) segments;
+    // tracks with length < 2 contribute none.
+    let nSegments = 0;
+    for (let i = 0; i < nTracks; i++) {
+      const len = tracks[i].length;
+      if (len >= 2) nSegments += len - 1;
+    }
+
+    const positions = new Float32Array(nSegments * 2 * 3);
+    const colors = new Float32Array(nSegments * 2 * 3);
+
+    let seg = 0;
+    for (let i = 0; i < nTracks; i++) {
+      const off = tracks[i].pointOffset * fpp;
+      const len = tracks[i].length;
+      for (let j = 0; j < len - 1; j++) {
+        const b0 = off + j * fpp;
+        const b1 = off + (j + 1) * fpp;
+
+        const p = seg * 6; // 2 verts * 3 floats
+        positions[p + 0] = pointData[b0 + 0];
+        positions[p + 1] = pointData[b0 + 1];
+        positions[p + 2] = pointData[b0 + 2];
+        positions[p + 3] = pointData[b1 + 0];
+        positions[p + 4] = pointData[b1 + 1];
+        positions[p + 5] = pointData[b1 + 2];
+
+        const speed0MmS = pointData[b0 + 4] * FRAME_RATE_HZ;
+        const speed1MmS = pointData[b1 + 4] * FRAME_RATE_HZ;
+        const c0 = cmapJet(speed0MmS / SPEED_SCALE_MAX_MM_S);
+        const c1 = cmapJet(speed1MmS / SPEED_SCALE_MAX_MM_S);
+        colors[p + 0] = c0[0];
+        colors[p + 1] = c0[1];
+        colors[p + 2] = c0[2];
+        colors[p + 3] = c1[0];
+        colors[p + 4] = c1[1];
+        colors[p + 5] = c1[2];
+
+        seg++;
+      }
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+
+    this.material = new THREE.LineBasicMaterial({
+      vertexColors: true,
+      transparent: opts.additive,
+      opacity: opts.additive ? 0.85 : 1.0,
+      blending: opts.additive ? THREE.AdditiveBlending : THREE.NormalBlending,
+      depthWrite: !opts.additive,
+      fog: true,
+      linewidth: opts.linewidth, // most ANGLE/GL backends clamp this to 1px, harmless to set
+    });
+
+    this.lines = new THREE.LineSegments(geometry, this.material);
+    this.nSegments = nSegments;
+  }
+
+  getObject3D() {
+    return this.lines;
+  }
+
+  setLinewidth(w) {
+    this.material.linewidth = w;
+  }
+
+  setAdditive(on) {
+    this.material.blending = on ? THREE.AdditiveBlending : THREE.NormalBlending;
+    this.material.transparent = on;
+    this.material.opacity = on ? 0.85 : 1.0;
+    this.material.depthWrite = !on;
+    this.material.needsUpdate = true;
+  }
+}
+
+// ============================================================
+// App
+// ============================================================
+
+const params = {
+  linewidth: 1.4,
+  additive: false,
+  fog: true,
+};
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setClearColor(0x000000); // pure black, matches the blog render
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const fog = new THREE.Fog(0x000000, 10, 220); // subtle depth fog, tuned once bbox is known
+scene.fog = fog;
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 500);
+camera.up.set(0, 0, 1);
+camera.position.set(15, 10, 30);
+
+const orbitControls = new OrbitControls(camera, renderer.domElement);
+orbitControls.enableDamping = true;
+orbitControls.dampingFactor = 0.05;
+orbitControls.target.set(0, 0, 15);
+orbitControls.update();
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+composer.addPass(new OutputPass());
+
+const info = document.getElementById("info");
+info.textContent = "Loading tracks...";
+
+// --- Legend ticks (built once; static 0/19/38 mm/s labels + rotated title) ---
+const legendEl = document.getElementById("legend");
+{
+  const ticks = document.createElement("div");
+  ticks.className = "ticks";
+  ticks.style.cssText = "height:190px;display:flex;flex-direction:column;justify-content:space-between;";
+  ["38", "19", "0"].forEach((v) => {
+    const s = document.createElement("span");
+    s.textContent = v;
+    ticks.appendChild(s);
+  });
+  const title = document.createElement("div");
+  title.className = "title";
+  title.textContent = "flow speed · mm/s";
+  legendEl.insertBefore(ticks, legendEl.firstChild); // ticks, bar, title (left to right, like the blog)
+  legendEl.appendChild(title);
+}
+
+// --- Scale bar (10 mm, live pixel width from camera projection) ---
+const scaleBarBar = document.getElementById("scalebar-bar");
+function updateScaleBar() {
+  const right = new THREE.Vector3();
+  const up = new THREE.Vector3();
+  const fwd = new THREE.Vector3();
+  camera.matrixWorld.extractBasis(right, up, fwd);
+  const half = 5.0; // mm; 10mm segment total
+  const p1 = orbitControls.target.clone().addScaledVector(right, -half);
+  const p2 = orbitControls.target.clone().addScaledVector(right, half);
+  p1.project(camera);
+  p2.project(camera);
+  const pxWidth = Math.abs((p2.x - p1.x) * 0.5 * window.innerWidth);
+  scaleBarBar.style.width = `${Math.max(pxWidth, 1)}px`;
+}
+
+let trackSystem = null;
+let trackData = null;
+
+async function init() {
+  try {
+    trackData = await loadTracks("data/tracks.bin");
+    info.textContent = `Loaded ${trackData.nTracks.toLocaleString()} streamlines (${trackData.totalPoints.toLocaleString()} points)`;
+
+    trackSystem = new LineTrackSystem(trackData, { linewidth: params.linewidth, additive: params.additive });
+    scene.add(trackSystem.getObject3D());
+
+    const bmin = new THREE.Vector3(...trackData.boundsMin);
+    const bmax = new THREE.Vector3(...trackData.boundsMax);
+    const size = bmax.clone().sub(bmin);
+    const center = bmin.clone().add(size.clone().multiplyScalar(0.5));
+    const diag = size.length();
+
+    // Depth fog scaled to the actual data extent (subtle: fades only the far field).
+    fog.near = diag * 0.6;
+    fog.far = diag * 2.2;
+
+    orbitControls.target.copy(center);
+    // Near-coronal default camera: look down the elevation (Y) axis at the
+    // XZ plane, framed a bit tighter so the vessel mass fills the frame
+    // (matches the blog composition).
+    camera.position.set(
+      center.x,
+      center.y + Math.max(size.x, size.z) * 0.95,
+      center.z
+    );
+    orbitControls.update();
+    updateScaleBar();
+
+    // Minimal GUI: kept out of the way (bottom-left), doesn't collide with
+    // the top-right legend or bottom-right scale bar.
+    const gui = new GUI({ title: "Brane" });
+    gui.domElement.style.position = "fixed";
+    gui.domElement.style.top = "auto";
+    gui.domElement.style.bottom = "12px";
+    gui.domElement.style.left = "12px";
+    gui.domElement.style.right = "auto";
+    gui.add(params, "linewidth", 1, 4, 0.1).name("Line width (px)").onChange((v) => trackSystem.setLinewidth(v));
+    gui.add(params, "additive").name("Additive blend").onChange((v) => trackSystem.setAdditive(v));
+    gui.add(params, "fog").name("Depth fog").onChange((v) => { scene.fog = v ? fog : null; });
+
+    info.textContent = `${trackData.nTracks.toLocaleString()} streamlines | drag to orbit`;
+  } catch (err) {
+    console.error(err);
+    info.textContent = `Error: ${err.message}`;
+  }
+}
+
+function render() {
+  orbitControls.update();
+  updateScaleBar();
+  composer.render();
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  render();
+}
+
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
+  updateScaleBar();
+});
+
+init().then(() => render());
+animate();
+    </script>
+  </body>
+</html>
