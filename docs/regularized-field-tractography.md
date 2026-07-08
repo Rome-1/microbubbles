@@ -136,9 +136,12 @@ showing the coherent flow *structure* that the reference's discrete point cloud 
   trajectories — arguably *more* informative, but a different object; state it plainly.
 - Dice 0.60 means ~40% of occupied voxels are half-specific; reproducibility is real but not
   perfect, and it depends on the smoothing σ.
-- Validated on the acq-0 slice; dataset-wide (all 216 acqs) is not yet run.
+- The imaged data is a single anatomical slice; the velocity field pools all 216
+  acquisition-repeats of it (504,090 reference localizations). *(Correction 2026-07-08: an
+  earlier draft framed this as an "acq-0 slice, dataset-wide not yet run" — the field is in fact
+  built from all 216 acquisitions, confirmed at full scale in mb-9ay/§8.4.)*
 - Gaussian smoothing is a crude regularizer — a physically-principled one (below) should do
-  better.
+  better. *(Done: mb-ki9, §8.1 — the along-vessel graph-Laplacian raises Dice 0.61→0.71.)*
 
 ---
 
@@ -166,6 +169,10 @@ showing the coherent flow *structure* that the reference's discrete point cloud 
    width to match/beat the blog's crispness.
 4. **Dataset-wide tractography** over all 216 acquisitions (field built at full scale) — and,
    if the maintainer releases the other 215 acqs' detections, an apples-to-apples comparison.
+   **✓ RESOLVED (2026-07-08, mb-9ay)** — the velocity field already pools all 216 acquisitions
+   (the reference pkl holds acq_index 0–215; the "acq-0 only / need the other 215" premise was
+   mistaken). The graph result holds at *full scale* (all 453,634 velocity samples, no 250k
+   subsample): Dice 0.709–0.714 / cos 0.945–0.950. `scripts/wf_render_signal/fullscale_validate.py`.
 5. **Quantitative coverage-vs-reference** on a shared grid (the render's coverage claim vs the
    reference tracks), reported honestly against a random-split null.
    **✓ DONE (2026-07-08, mb-ska)** — our field-tractography covers ~90% of the reference's 50,456

@@ -8,7 +8,9 @@ improvement. A matched-diffusivity *isotropic* control collapses (Dice 0.07, cos
 proving the gain comes from anisotropy, not from more smoothing.
 
 Author: microbubbles/crew (Gas Town). Date: 2026-07-08. Data: Aleph Neuro sanitized
-ultratrace, acq-0 slice (216 acquisitions, odd/even split-half). Builds on
+ultratrace — the velocity field is built from **all 216 acquisition-repeats** of the
+imaged slice (504,090 reference localizations, 250k velocity-sample subsample);
+split-half is over odd/even *acquisition* index. Builds on
 `docs/regularized-field-tractography.md` §8.1. Method: `scripts/wf_render_signal/tractography_pde.py`.
 
 ---
@@ -161,8 +163,12 @@ Artifact: `outputs/.../velocity-field/coverage_vs_reference.json`
 
 ## 5. Caveats
 
-- Validated on the acq-0 slice (same scope as the baseline); dataset-wide (216 acqs)
-  is bead mb-9ay.
+- The field already pools all 216 acquisition-repeats, so these numbers are
+  dataset-wide, not a single acquisition (mb-9ay). Confirmed at **full scale** too:
+  rebuilding from all 453,634 velocity samples (no 250k subsample) gives Dice
+  0.709–0.714 / cos 0.945–0.950 — matching the subsampled run
+  (`scripts/wf_render_signal/fullscale_validate.py`). The earlier "acq-0 only /
+  need the other 215 acqs" framing was mistaken: the reference pkl holds all 216.
 - γ, iters chosen at a *moderate* operating point (higher iters/lower γ push Dice to
   ~0.73 but risk over-smoothing); we deliberately did not metric-maximize.
 - Incompressibility is neutral on this data (above); revisit on 3D-resolved elevation.
