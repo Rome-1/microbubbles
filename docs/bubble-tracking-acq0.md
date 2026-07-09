@@ -69,22 +69,63 @@ push to "recover crossings / match cl 0.53" (multi-vector, ODF) was optimizing a
 and, worse, our low-cl tracks were partly **tracking error** (jagged mis-links scatter direction).
 Grounding in the data reverses the target: a good within-acq tracker should be *coherent*.
 
-## Honest residual gap (future work)
+## Residual investigation — three parallel probes (2026-07-09)
 
-Our smoothed tracks run **faster (40 vs 26 mm/s)** and **turn more (18° vs 8°)** than the reference,
-and sit at `cl 0.55` vs `0.72` — our association is slightly noisier (some links reach a bit too far;
-some residual jaggedness). Closing it:
-1. **Global / multi-frame association** (min-cost-flow or fixed-lag smoothing over a window) instead
-   of greedy per-frame Hungarian — resolves ambiguous links with future evidence.
-2. **RTS (Kalman) smoothing** and/or matched post-smoothing to the reference's exact scheme.
-3. **Detection quality** — gate/weight links by localization confidence (z-score) to drop marginal
-   detections the reference discards.
+The initial residual (smoothed speed 40 vs 26 mm/s, turning 18° vs 8°, cl 0.55 vs 0.72) was
+attacked from three independent angles at once (`track_rts.py`, `track_zgate.py`, `track_global.py`).
+They **converge**, and they **correct the attribution above**: the turn gap was *not* greedy
+mis-linking.
+
+**1. RTS (Kalman) smoothing — WINS on turning + coherence (`track_rts.py`).** A proper
+Rauch-Tung-Striebel backward smoother (same links as the baseline), with process noise swept to the
+physiological match `sigma_a≈0.05`: **turning 18°→7.7° (ref 8.1), cl 0.55→0.70 (ref 0.72)**, beating
+Savitzky-Golay at equal-or-better coherence. The turn gap was a **smoothing under-fit** — the baseline
+used Savgol window 5; it already matches the reference at window ~11 or, principledly, via RTS. *Honest
+limit:* the **filtered** one-step error (0.20 mm — the un-fakeable link-quality anchor) is **unchanged**;
+RTS is a backward pass that improves the trajectory *estimate*, it does not re-associate detections. So
+turning/cl were an estimation/rendering property, not a linking error.
+
+**2. Detection-quality gating — NOT the fix, but a validated diagnostic (`track_zgate.py`).**
+Confirmed the reference's ~31% kept detections are heavily high-confidence (near-track z 9.3 vs far 6.0,
+p≈0; kept-fraction rises Q1 4.8% → Q4 45.4% with z). But *reproducing* that selection does not reproduce
+its slow tracks: hard z-thresholding improves turning/cl only at the p90 extreme, which craters coverage
+to 6% (vs ref 31%), and **speed never moves** (~40 at every threshold). Soft z-weighting of the Kalman R
+was harmful (fragmented tracks). A mild **z≥p25 prefilter** is a free small win (keeps ~75% of input at
+≈reference coverage, cl 0.57, one-step 0.196 mm) — worth adopting, but not the residual's cause.
+
+**3. Global / min-cost-flow association — NOT the fix (`track_global.py`).** A second-order min-cost
+network-flow tracker (curvature-aware) and a global fragment-stitcher. Min-cost-flow does **not** beat
+the greedy KF at matched coverage — at 32% it is *worse* (turn 13.3, speed 43.8), and only looks smooth
+by cherry-picking 11% coverage. Root cause: per-frame steps (~0.12 mm) sit at the localization-jitter
+floor (~0.12 mm), so raw segment directions are noise-dominated and the KF's *recursive velocity
+smoothing* is exactly what suppresses jaggedness — a raw-link flow can't replicate it. Stitching is a
+modest **continuity** (topology) win, not a physiology one.
+
+### The one genuine residual: speed / over-reach — a selectivity tradeoff, not a bug
+
+Speed (~36 vs 26 mm/s) is the only real remaining gap. It **plateaus under smoothing**, is **unmoved by
+z-gating**, and is **not helped by global association**. Our tracker reaches to slightly farther
+detections to hold 33% coverage; the reference links tighter/slower and **discards 69%**. We can match
+the reference's speed only by tightening the association gate and *dropping coverage* — a genuine
+**gate-vs-coverage selectivity tradeoff**, not a fixable error. It is visible in
+`renders/track_global_vs_reference.png` (ours redder = faster) and offers two honest operating points:
+**high-coverage** (33% linked, speed ~36) vs **reference-matched tight-gate** (fewer links, speed →26).
+
+### Recommended production config
+
+`track_rts.py::track_kf_rts` at **`sigma_a≈0.05` + RTS smoothing + z≥p25 prefilter**: matches the
+reference on **turning (7.7 vs 8.1°) and coherence (cl 0.70 vs 0.72)** at ≈reference coverage; the speed
+residual is the selectivity knob (tighten the gate to trade coverage for reference-matched speed). This
+is the tracker to scale to 216 acqs.
 
 ## Bottom line
 
 We are **back to independently tracked bubble trajectories** — the right object — with a principled
-Kalman tracker validated against the reference on identical acq-0 data (matched length/coverage, 70%
-direction agreement, 80% bootstrap-stable), and no new data used. It is **ready to scale to all 216
-acquisitions** the moment the 215-acq detections arrive (`mb-4yw`) — which is the actual unblock for a
-reference-density tracked reconstruction. The within-acq coherence finding corrects the objective:
-ground in the data, don't import the reference's pooled diversity as a target.
+Kalman tracker (KF + RTS smoothing) validated against the reference on identical acq-0 data. After the
+residual investigation it **matches the reference on turning (7.7 vs 8.1°), coherence (cl 0.70 vs
+0.72), and coverage/length**, is 80% bootstrap-stable, and used no new data. The single remaining gap
+— speed (~36 vs 26 mm/s) — is a **characterized selectivity tradeoff** (gate vs coverage), not an
+error. It is **ready to scale to all 216 acquisitions** the moment the 215-acq detections arrive
+(`mb-4yw`, watched by `scripts/monitor_data_unblock.sh`) — the actual unblock for a reference-density
+tracked reconstruction. The within-acq coherence finding corrects the objective: ground in the data,
+don't import the reference's pooled diversity as a target.
