@@ -150,3 +150,51 @@ weighted proportionally) — risks noise, gate by split-half; (b) sparser+thinne
 match reference density; (c) revisit temporal tracking on the recovered dense detections
 (mb-aro) — the reference's actual advantage. The `cl`-vs-reference distance in §3 is now
 the objective to optimize any of these against.
+
+## 7. Resolution — three experiments, gap closed (measured 2026-07-09)
+
+Ran three experiments in parallel against the §3 objective (plus a cross-method overlap
+analysis). Decision doc: `docs/reconstruction-scorecard.md`. Headline: **path (a) works** —
+an ODF-style multi-peak field closes the gap, and the recovered crossings are real.
+
+| reconstruction | mean `cl` | crossing-frac | KS to ref | split-half | verdict |
+|---|---|---|---|---|---|
+| single-vector field (combed) | 0.99 | 0.00 | large | — | reproducible, not diverse |
+| multi-vector fix v1 (§6) | 0.83 | 0.05 | 0.488 | — | partial |
+| **ODF spatial fix** | **0.565** | **0.273** | **0.080** | `cl r=0.324` (real) | **closes gap (89%)** |
+| temporal tracking (acq-0) | 0.33 | 0.71 | — | — | viable, under-supplied |
+| Aleph reference (target) | 0.531 | 0.349 | 0 | `cl r≈0.32` | the ruler |
+
+1. **ODF spatial fix (`scripts/wf_render_signal/odf_fix.py`).** Estimate a per-voxel orientation
+   distribution and keep *every split-half-reproduced peak* (not the mean); seed streamlines
+   proportional to peak dispersion. `cl` 0.83→**0.565** (reference 0.531), KS-distance
+   0.488→**0.080** (89% of the distributional gap). The **1,129 extra crossing/branch peaks
+   reproduce split-half** (`cl r=0.324` vs reference ~0.32) — the crossings are structure, not
+   denoising artifacts. This is the fix: stop averaging, keep the *reproducible* modes. Because it
+   decomposes the same occupied voxels, it keeps the field's coverage (~90%); its measured
+   **occupancy split-half Dice is 0.65** (field 0.71 — adding diversity costs ~8%, still strongly
+   reproducible vs an isotropic control's 0.07). So it is diverse **and** defensible.
+   `renders/odf_vs_reference.png`.
+
+2. **Overlap / consensus (`overlap_consensus.py`).** Cross-method validation: densely rasterize
+   both reconstructions on the shared grid. The **shared** set (10.5k vox, 64% of the reference)
+   is where both methods independently agree; the fair per-voxel test shows agreement flags real
+   high-confidence voxels (shared reproduces 0.69 vs 0.44 for ref-only, for the reference). It
+   also attributes the two methods cleanly: **ref-only = diverse fine detail** (cl 0.61, what the
+   ODF fix recovers) vs **ours-only = extra coverage but combed** (cl 0.96). Consensus is a
+   *validation/attribution* tool — its Dice (0.48) does not beat the field (0.71), so it is not
+   itself the answer. `renders/overlap_consensus.png`.
+
+3. **Temporal tracking (`temporal_tracking.py`).** Refutes the §6 assertion that we "can't track
+   at our concentration": on acq-0, each detection has **0.00 competitors within one linking gate**
+   → linking is unambiguous. Tracks are diverse (`cl 0.33`, partly tracker noise), linking 26% of
+   detections (reference discards a comparable ~69%). But one acquisition gives only 362 short
+   tracks — reference density/length need the pooled 216 acqs. **Viable, under-supplied** — the
+   strongest argument for re-requesting the other 215 acqs' raw detections (issue #2).
+   `renders/tracking_vs_reference.png`.
+
+**Net:** the two-deliverable hedge from §6 is retired. Ship **one object — the ODF multi-peak
+field**, now validated as diverse *and* reproducible (`cl 0.565`/KS 0.080; diversity split-half
+`r 0.324`; occupancy split-half Dice 0.65 vs the combed field's 0.71 — the measured cost of
+diversity), with the single-vector graph-field as the conservative core it collapses to, and
+temporal tracking as the data-gated upside. See the scorecard for the full decision.
