@@ -1,5 +1,14 @@
 # The flow-diversity gap: why the reference render looks better, and how to measure it
 
+> **⚠️ REFRAMED (2026-07-09).** Rome corrected the objective after this investigation: the goal is
+> **accurate tracked bubble trajectories** (GT-free-validated), not visual match and not the
+> orientation-diversity `cl` used throughout below. Matching the reference's `cl≈0.53` was an
+> **unjustified prior** — within a single acquisition the data is *coherent* (`cl≈0.72`); the 0.53
+> "diversity" is mostly *inter-acquisition* pooling, and our low-`cl` tracks were partly tracking
+> error. So the "diversity gap" this doc chases is largely an artifact. Current direction:
+> **`docs/bubble-tracking-acq0.md`**. This doc and its `cl` metric are kept for the record.
+
+
 **Status: OPEN investigation (2026-07-09).** Prompted by Rome's visual read: *none of our
 renders look like what Aleph shipped; theirs strikes a better balance across many different
 flows, ours prefers lots of parallel long-track work; theirs looks better and it's unclear how

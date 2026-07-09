@@ -1,5 +1,14 @@
 # Reconstruction scorecard: what we ship, and for whom
 
+> **⚠️ REFRAMED (2026-07-09, after this doc was written).** Rome corrected the objective: the goal
+> is the **most accurate tracked bubble trajectories**, GT-free-validated — *not* beauty and *not*
+> matching the reference's orientation-diversity (`cl`). Treating `cl≈0.53` as a target was an
+> unjustified prior: within a single acquisition the data is **coherent** (`cl≈0.72`); the 0.53
+> "diversity" is largely *inter-acquisition* pooling. So this doc's diversity-matching framing (the
+> ODF fix, the G1/G2 "science vs beauty" split) optimizes the wrong quantity. It is kept for the
+> record; the current direction is in **`docs/bubble-tracking-acq0.md`** (return to independent
+> bubble tracking). The velocity-field work was a means to tracking, not the end.
+
 **Status: RESOLVED (2026-07-09).** This is the decision doc that reconciles the competing
 reconstructions of the 3D-ULM vasculature. It exists because we conflated two objectives that
 pull in opposite directions (see `docs/flow-diversity-gap.md` §2, §6). It has one job: state the
