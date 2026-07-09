@@ -113,3 +113,40 @@ extra channels. Fragment-rendering the raw samples (which already sit at cl 0.51
 sparse-and-diverse demonstration.
 
 Scripts: `scripts/wf_render_signal/flow_diversity.py` (metric), `render_flow_diversity.py` (figure).
+
+## 6. Fix v1 — multi-vector field (measured 2026-07-09)
+
+`scripts/wf_render_signal/tractography_multivector.py`: per voxel, greedy angular
+clustering of the velocity samples into up to 3 flow MODES (samples pooled over an
+in-plane neighbourhood to denoise); a crossing-preserving render primitive
+(`mv_streamlets`) seeds one short bidirectional streamlet **per mode per voxel** — a
+2-mode voxel emits two crossing streamlets, like dMRI multi-fibre glyphs.
+
+Clustering finds real multi-modality: of ~14k occupied voxels, **26% carry ≥2 modes**
+(3.1k two-mode, 0.5k three-mode). Result:
+
+| reconstruction | mean cl | crossing-frac |
+|---|---|---|
+| single-vector field streamlines (before) | 0.99 | 0.00 |
+| **multi-vector short streamlets (fix v1)** | **0.83** | 0.05 |
+| Aleph reference (target) | 0.53 | 0.35 |
+
+**Outcome: a real, visible improvement — cl 0.99 → 0.83, and the render
+(`renders/multivector_vs_reference.png`) goes from uniform color blocks (combed) to
+many intermixed diverse short primitives that recover the reference's fans/arcs/
+crossings — but it does NOT fully close the gap (0.83 vs 0.53) and is still denser.**
+
+Why the residual gap, honestly: our spatial mode-clustering has to *denoise*, and
+denoising merges near-crossings (the second mode is often a minority, so few streamlets
+follow it → the voxel stays coherent). The reference reaches cl 0.53 by *temporal*
+denoising — linking each bubble into a track over frames — which preserves diversity
+because a track follows one bubble; we can't track well at our concentration (the whole
+reason we went field-based). So there's a genuine tension: **long+reproducible (our
+field-tractography science claim) vs short+diverse (the reference-like render)** — they
+are different objects optimizing different axes.
+
+Paths to close further (next): (a) looser/ODF-style multi-modal estimation (more modes,
+weighted proportionally) — risks noise, gate by split-half; (b) sparser+thinner render to
+match reference density; (c) revisit temporal tracking on the recovered dense detections
+(mb-aro) — the reference's actual advantage. The `cl`-vs-reference distance in §3 is now
+the objective to optimize any of these against.
