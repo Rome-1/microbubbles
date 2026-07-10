@@ -107,9 +107,20 @@ Speed (~36 vs 26 mm/s) is the only real remaining gap. It **plateaus under smoot
 z-gating**, and is **not helped by global association**. Our tracker reaches to slightly farther
 detections to hold 33% coverage; the reference links tighter/slower and **discards 69%**. We can match
 the reference's speed only by tightening the association gate and *dropping coverage* — a genuine
-**gate-vs-coverage selectivity tradeoff**, not a fixable error. It is visible in
-`renders/track_global_vs_reference.png` (ours redder = faster) and offers two honest operating points:
-**high-coverage** (33% linked, speed ~36) vs **reference-matched tight-gate** (fewer links, speed →26).
+**gate-vs-coverage selectivity tradeoff**, not a fixable error. A hard per-frame step gate (scaled by
+the reference's own anisotropic `max_distance_mm`) is the knob; `track_operating_points.py` renders
+both ends beside the reference (`renders/track_operating_points.png`, speed-jet 0-40):
+
+| operating point | tracks | linked | speed med | speed p90 | cl |
+|---|---|---|---|---|---|
+| reference | 292 | 31% | 25.8 | 59.3 | 0.73 |
+| **high-coverage** (loose) | 561 | 51% | 45.4 | 138 | 0.60 |
+| **reference-matched** (step≤0.6) | 326 | 25% | 25.1 | 56.9 | 0.58 |
+
+The tight gate reproduces the reference's speed distribution (median 25.1 vs 25.8, p90 56.9 vs 59.3)
+and its sparse slow look; high-coverage tracks ~2× the bubbles at the cost of faster/marginal links
+(and some over-linked clusters). The reference operates near our tight-gate point — it is selective by
+design. Choice of point is a science decision (coverage vs cleanliness), not a bug to fix.
 
 ### Recommended production config
 
