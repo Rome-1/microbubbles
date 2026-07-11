@@ -122,12 +122,54 @@ and its sparse slow look; high-coverage tracks ~2× the bubbles at the cost of f
 (and some over-linked clusters). The reference operates near our tight-gate point — it is selective by
 design. Choice of point is a science decision (coverage vs cleanliness), not a bug to fix.
 
-### Recommended production config
+### UPDATE (2026-07-11): the speed "residual" was largely OUR config, not a tradeoff
 
-`track_rts.py::track_kf_rts` at **`sigma_a≈0.05` + RTS smoothing + z≥p25 prefilter**: matches the
-reference on **turning (7.7 vs 8.1°) and coherence (cl 0.70 vs 0.72)** at ≈reference coverage; the speed
-residual is the selectivity knob (tighten the gate to trade coverage for reference-matched speed). This
-is the tracker to scale to 216 acqs.
+The dataset's `params` (read out of the pkl when checking the acquisition specs) document the
+**reference's own tracker settings**: `tracking_method: kalman`, `max_distance_mm = (0.40, 1.11,
+0.40)` (= step_scale **1.0**), `max_gap: 3`, `min_track_length: 5`, `post_smoothing: gaussian
+sigma 2.0`. We had been running `max_gap=2`, `min_len=4`, no confidence prefilter, Savgol
+smoothing — i.e. we differed from them in several places *we never intended to*.
+
+Running **their config** (their gate/gap/length filter) with **our KF + RTS + z≥p25 prefilter**
+(`track_production.py --mode reference-config`) reproduces the reference across every axis at once:
+
+| | tracks | mean len | max | speed med | turn | cl | dir-agree |
+|---|---|---|---|---|---|---|---|
+| reference | 292 | 10.3 | 68 | 25.8 | 8.1 | 0.73 | — |
+| **reference-config (ours)** | 249 | **10.7** | **67** | **27.8** | 11.3 | **0.65** | 73% |
+| reference-matched (step≤0.6 clamp) | 234 | 9.2 | 46 | 23.6 | 16.3 | 0.59 | 72% |
+| high-coverage | 355 | 11.7 | 68 | 44.6 | 18.9 | 0.58 | 71% |
+
+**So the earlier "speed 36 vs 26 is an irreducible selectivity tradeoff" conclusion was wrong** —
+it was an artifact of a config mismatch. At their settings we land at 27.8 vs 25.8 mm/s with
+matching track lengths (10.7/67 vs 10.3/68). The brute-force tight-gate point (step≤0.6) is now
+**superseded**: it matched the speed *statistic* by clamping, at the cost of track length (max 46
+vs 68) and smoothness (turn 16.3°). Matching the *mechanism* beat matching the *statistic*.
+
+Residual differences are now modest and honest: fewer tracks (249 vs 292 — the z-prefilter drops
+25% of detections), turning 11.3° vs 8.1°, cl 0.65 vs 0.73. The real remaining choice is
+**reference-config** (faithful reproduction) vs **high-coverage** (355 tracks, ~2× bubbles, faster
+links) — a science decision, not a defect.
+
+## Recommended production config
+
+**`scripts/wf_render_signal/track_production.py`** — the single consolidated, scale-ready entry point
+(z≥p25 prefilter → Kalman filter w/ Mahalanobis gate → operating-point step gate → RTS smoothing),
+folding the whole investigation into one command so the unblock is instant:
+
+```
+python3 scripts/wf_render_signal/track_production.py --mode reference-config     # default
+python3 scripts/wf_render_signal/track_production.py --mode high-coverage
+```
+
+It runs over **any** set of acquisitions (acq-0 today; all 216 unchanged the moment `mb-4yw` lands),
+self-validates on acq-0 against the reference, and writes `outputs/.../tracks_production_<mode>.npz`.
+
+**Compute hygiene is enforced in code, not by convention** (this rig once drove the shared box to
+load ~67): every worker `os.nice(15)`s itself and pins BLAS to 1 thread, worker count is
+**hard-capped at 4** regardless of the flag, and the run **pauses** whenever the 1-min load average
+exceeds 30 (renicing does not lower load average — pausing does). 216 acquisitions is embarrassingly
+parallel, which is exactly why the cap is not optional.
 
 ## Bottom line
 

@@ -74,8 +74,11 @@ def _rts_smooth(xf, Pf, xp, Pp, AA):
     return np.array(xs)
 
 
+GATE_ANISO = np.array([0.4008175, 1.1093333, 0.4015686])   # reference max_distance_mm
+
+
 def track_kf_rts(P, F, sigma_a=0.03, sigma_z=0.12, gate_chi2=9.0, v0=0.5,
-                 max_gap=2, min_len=4):
+                 max_gap=2, min_len=4, max_step_scale=np.inf):
     """Constant-velocity Kalman FILTER (association identical to track_bubbles.track_kf)
     with per-step internals stored, then RTS-smoothed per track on retire.
 
@@ -128,6 +131,14 @@ def track_kf_rts(P, F, sigma_a=0.03, sigma_z=0.12, gate_chi2=9.0, v0=0.5,
                 y = D - zpred[t]
                 C[t] = np.einsum("mi,ij,mj->m", y, Si, y)
             C[C > gate_chi2] = BIG
+            # operating-point knob (default off): hard per-frame step (speed) gate on the raw
+            # displacement, scaled by the reference's anisotropic max_distance_mm. The
+            # Mahalanobis gate alone cannot lower median speed; this is what trades coverage
+            # for reference-matched speed. See docs/bubble-tracking-acq0.md.
+            if np.isfinite(max_step_scale):
+                dtf = np.maximum(1, f - last_f)[:, None]
+                sd = np.linalg.norm((D[None, :, :] - X[:, :3][:, None, :]) / GATE_ANISO, axis=2) / dtf
+                C[sd > max_step_scale] = BIG
             ri, ci = linear_sum_assignment(C)
             ok = C[ri, ci] < BIG
             ri, ci = ri[ok], ci[ok]
