@@ -174,8 +174,8 @@ speed 22 vs 26). The real remaining choice is **reference-config** (faithful rep
 ## Recommended production config
 
 **`scripts/wf_render_signal/track_production.py`** — the single consolidated, scale-ready entry point
-(z≥p25 prefilter → Kalman filter w/ Mahalanobis gate → operating-point step gate → RTS smoothing),
-folding the whole investigation into one command so the unblock is instant:
+(**no prefilter → Kalman filter w/ Mahalanobis gate → operating-point step gate → Gaussian σ=2
+post-smooth**), folding the whole investigation into one command so the unblock is instant:
 
 ```
 python3 scripts/wf_render_signal/track_production.py --mode reference-config     # default
@@ -191,14 +191,52 @@ load ~67): every worker `os.nice(15)`s itself and pins BLAS to 1 thread, worker 
 exceeds 30 (renicing does not lower load average — pausing does). 216 acquisitions is embarrassingly
 parallel, which is exactly why the cap is not optional.
 
-## Bottom line
+## Reference-independent accuracy + adversarial re-check (2026-07-14)
 
-We are **back to independently tracked bubble trajectories** — the right object — with a principled
-Kalman tracker (KF + RTS smoothing) validated against the reference on identical acq-0 data. After the
-residual investigation it **matches the reference on turning (7.7 vs 8.1°), coherence (cl 0.70 vs
-0.72), and coverage/length**, is 80% bootstrap-stable, and used no new data. The single remaining gap
-— speed (~36 vs 26 mm/s) — is a **characterized selectivity tradeoff** (gate vs coverage), not an
-error. It is **ready to scale to all 216 acquisitions** the moment the 215-acq detections arrive
-(`mb-4yw`, watched by `scripts/monitor_data_unblock.sh`) — the actual unblock for a reference-density
-tracked reconstruction. The within-acq coherence finding corrects the objective: ground in the data,
-don't import the reference's pooled diversity as a target.
+An adversarial re-check (codex) made a correct and load-bearing point: **matching the reference — which
+is not ground truth — is not the same as validating tracking accuracy.** Reference-matching is
+circular (the config was chosen partly to match reference coverage/turning, then the match cited as
+validation); direction-agreement and bootstrap stability do not bound the mis-link rate; and the
+Gaussian σ=2 smoothing partly manufactures the matched turning/coherence while leaving associations
+untouched. That critique is accepted. Two reference-independent tests were added
+(`track_sim_validate.py`), both on **raw** detection links (smoothing-independent):
+
+- **Held-out linked-detection prediction (real acq-0).** Hold out 15% of the detections that form
+  tracks, re-track, predict their positions: **median error 0.32 mm, 64% within 0.5 mm, 9.2× better
+  than a frame-shuffled null**. (Restricted to linked detections — the un-trackable ~68% have no track
+  to predict them, which is why the same test over *all* detections looks like chance.)
+- **Synthetic link precision/recall (planted ground truth, matched to acq-0 stats).** On simulated
+  bubbles with known links at acq-0's density/speed/length/noise: **link precision 0.86 ± 0.02**
+  (≈14% of the tracker's links are wrong) and **recall 0.61 ± 0.02** (misses ≈39% of true links,
+  mostly across gaps and in dense regions). Config carried over unchanged, so the 5 seeds are held-out
+  realizations.
+
+**Honest limits of these numbers.** The simulation uses independent smooth trajectories + uniform
+noise (no vessel crossings/confluences, where linking is hardest), so **0.86 is likely optimistic**
+for real vasculature. There is still **no held-out real acquisition** and **no per-acq QC** — both
+require the 215-acq unblock. So the standing claim is downgraded accordingly.
+
+## Bottom line (calibrated)
+
+We are back to independently tracked bubble trajectories with a principled Kalman + Gaussian-smooth
+tracker that (a) reproduces the reference tracker on identical acq-0 detections across count, length,
+turning, and coverage, and (b) shows **link precision ≈0.86 / recall ≈0.61 on matched synthetic
+ground truth** — the first accuracy evidence that does not lean on the reference. It is **not** yet
+"validated for accuracy": that needs held-out real acquisitions, per-acq QC, and link-level checks on
+real crossings — all gated on the 215-acq unblock (`mb-4yw`, watched by
+`scripts/monitor_data_unblock.sh`). The scale-up must run a **frozen protocol** (config + metrics +
+thresholds fixed before seeing the data) to avoid the single-acquisition tuning=validation trap. The
+within-acq coherence finding stands and corrects the objective: ground in the data, don't import the
+reference's pooled diversity as a target.
+
+### Frozen validation protocol for the 215-acq scale-up (pre-registered)
+
+Fix before running: config = `reference-config` (no prefilter, σ_a=0.05, gate_chi2=9, step 1.0,
+max_gap=3, min_len=5, Gaussian σ=2) and `high-coverage`, both unchanged from here. On arrival:
+1. **Per-acq QC gate** — detection density, per-frame displacement distribution, innovation/NIS,
+   linked fraction, track fragmentation; flag acqs outside acq-0's calibration envelope rather than
+   silently tracking them.
+2. **Held-out acquisitions** — tune nothing; report the acq-0 metrics on a random held-out subset of
+   acqs and quote the degradation.
+3. **Link-level accuracy** — extend `track_sim_validate.py` with vessel-crossing geometry, and (if any
+   labeled/paired detections exist) report real link precision/recall, not only synthetic.
