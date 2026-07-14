@@ -141,15 +141,35 @@ Running **their config** (their gate/gap/length filter) with **our KF + RTS + z�
 | high-coverage | 355 | 11.7 | 68 | 44.6 | 18.9 | 0.58 | 71% |
 
 **So the earlier "speed 36 vs 26 is an irreducible selectivity tradeoff" conclusion was wrong** —
-it was an artifact of a config mismatch. At their settings we land at 27.8 vs 25.8 mm/s with
-matching track lengths (10.7/67 vs 10.3/68). The brute-force tight-gate point (step≤0.6) is now
+it was an artifact of a config mismatch. The brute-force tight-gate point (step≤0.6) is
 **superseded**: it matched the speed *statistic* by clamping, at the cost of track length (max 46
 vs 68) and smoothness (turn 16.3°). Matching the *mechanism* beat matching the *statistic*.
 
-Residual differences are now modest and honest: fewer tracks (249 vs 292 — the z-prefilter drops
-25% of detections), turning 11.3° vs 8.1°, cl 0.65 vs 0.73. The real remaining choice is
-**reference-config** (faithful reproduction) vs **high-coverage** (355 tracks, ~2× bubbles, faster
-links) — a science decision, not a defect.
+### Closing the last two gaps (2026-07-14)
+
+The remaining differences (fewer tracks, higher turning) also traced to config, `track_tighten.py`:
+
+- **Track count** — the z≥p25 prefilter, adopted earlier as an accuracy win, was dropping ~46
+  real tracks (bootstrap-stable at 83%) for a cl change of 0.64→0.65. Removing it recovers 295
+  tracks (reference 292) at 31.7% linked (reference 31%).
+- **Turning** — was under-smoothing. But `sigma_a` sets both the smoothing *and* the Kalman gate,
+  so lowering it to smooth also tightens the gate and drops coverage (sigma_a 0.03 → 268 tracks,
+  0.02 → 235). The reference avoids this by **decoupling**: a moderate filter for coverage, then a
+  separate Gaussian sigma=2 post-smooth (its documented `post_smoothing_sigma`). Doing the same —
+  filter at sigma_a=0.05, post-smooth Gaussian sigma=2 — sets turning independently of coverage,
+  and direction-agreement holds at 75% (smoothing is not erasing link structure).
+
+Tightened **reference-config** (filter sigma_a=0.05, no prefilter, Gaussian sigma=2), acq-0:
+
+| | tracks | mean | max | speed | turn | cl | dir-agree |
+|---|---|---|---|---|---|---|---|
+| reference | 292 | 10.3 | 68 | 25.8 | 8.1 | 0.73 | — |
+| **reference-config** | 295 | 10.5 | 67 | 22.1 | 7.6 | 0.68 | 75% |
+| high-coverage | 464 | 11.0 | 69 | 33.5 | 8.2 | 0.63 | 70% |
+
+Reproduces the reference on count, length, and turning; small residuals remain (cl 0.68 vs 0.73,
+speed 22 vs 26). The real remaining choice is **reference-config** (faithful reproduction) vs
+**high-coverage** (~1.6× bubbles, faster links) — a science decision, not a defect.
 
 ## Recommended production config
 

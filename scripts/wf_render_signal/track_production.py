@@ -34,17 +34,39 @@ MAX_WORKERS = 4          # HARD CAP — do not raise. Shared 16-vCPU box, 14 oth
 LOAD_PAUSE = 30.0        # pause the run above this 1-min load average
 LOAD_POLL_S = 20
 
-# max_gap=3 / min_len=5 are the REFERENCE's own documented values (pkl params:
-# max_gap: 3, min_track_length: 5, max_distance_mm = step_scale 1.0) — use them everywhere
-# so we differ from the reference only where we mean to.
+# max_gap=3 / min_len=5 / step_scale 1.0 are the REFERENCE's own documented values (pkl params:
+# max_gap 3, min_track_length 5, max_distance_mm = step_scale 1.0, post_smoothing gaussian sigma 2).
+# Coverage/track-count is set by the FILTER (sigma_a via the gate); turning is set by the SEPARATE
+# post-smoother — decoupled, so tuning smoothness does not cost coverage (mirrors the reference's
+# kalman + gaussian-sigma-2 pipeline). No z-prefilter: it dropped ~46 real bootstrap-stable tracks
+# for a negligible cl change (see docs/bubble-tracking-acq0.md).
+TRACKER_KEYS = ("sigma_a", "gate_chi2", "max_step_scale", "max_gap", "min_len")
 MODES = {
-    # their exact gate + gap + length filter: "can our KF reproduce them on their own config?"
-    "reference-config":  dict(sigma_a=0.05, gate_chi2=9.0, max_step_scale=1.0, max_gap=3, min_len=5),
-    # brute-force speed match (tighter than their gate — matches the statistic, not the mechanism)
-    "reference-matched": dict(sigma_a=0.05, gate_chi2=9.0, max_step_scale=0.6, max_gap=3, min_len=5),
-    "high-coverage":     dict(sigma_a=0.10, gate_chi2=16.0, max_step_scale=2.0, max_gap=3, min_len=5),
+    # faithful reproduction of the reference on its own config
+    "reference-config": dict(sigma_a=0.05, gate_chi2=9.0, max_step_scale=1.0, max_gap=3, min_len=5,
+                             zpct=None, smoother="gaussian2"),
+    # ~2x the bubbles tracked, faster/marginal links — a coverage-vs-cleanliness science choice
+    "high-coverage":    dict(sigma_a=0.10, gate_chi2=16.0, max_step_scale=2.0, max_gap=3, min_len=5,
+                             zpct=None, smoother="gaussian2"),
 }
-Z_PREFILTER_PCT = 25     # keep detections with z >= 25th percentile (free accuracy win)
+
+
+def _smooth(recs, smoother):
+    """Post-smooth the filtered states. 'rts' = Rauch-Tung-Striebel; 'gaussianN' = Gaussian
+    sigma=N on the filtered positions (the reference uses gaussian sigma=2)."""
+    from track_rts import tracks_rts, tracks_filt
+    if smoother == "rts":
+        return tracks_rts(recs)
+    if smoother.startswith("gaussian"):
+        from scipy.ndimage import gaussian_filter1d
+        sig = float(smoother[len("gaussian"):] or 2.0)
+        out = []
+        for p, f in tracks_filt(recs):
+            if len(p) >= 3:
+                p = np.column_stack([gaussian_filter1d(p[:, k], sig, mode="nearest") for k in range(3)])
+            out.append((p, f))
+        return out
+    raise ValueError(f"unknown smoother {smoother!r}")
 
 
 def load1() -> float:
@@ -68,9 +90,10 @@ def _init_worker():
         os.environ[v] = "1"
 
 
-def load_detections(zpct=Z_PREFILTER_PCT):
-    """All released detections, grouped by acquisition, after the z-confidence prefilter.
-    Today this yields acq-0 only; when the 215-acq data lands it yields all 216 unchanged."""
+def load_detections(zpct=None):
+    """All released detections, grouped by acquisition, optionally after a z-confidence prefilter
+    (zpct=None -> keep all). Today this yields acq-0 only; when the 215-acq data lands it yields
+    all 216 unchanged."""
     from render_flow_diversity import SU
     o = SU(open(REF, "rb")).load()
     d = o["detections"]
@@ -78,30 +101,34 @@ def load_detections(zpct=Z_PREFILTER_PCT):
     F = np.asarray(d["frame_indices"], int)
     A = np.asarray(d["acq_indices"], int)
     Z = np.asarray(d["zscores"], float)
-    thr = np.percentile(Z, zpct)
-    keep = Z >= thr
-    print(f"  z-prefilter: keep z >= {thr:.2f} (p{zpct}) -> {keep.sum()}/{len(Z)} "
-          f"({keep.mean()*100:.0f}%) detections")
-    P, F, A = P[keep], F[keep], A[keep]
+    if zpct is not None:
+        keep = Z >= np.percentile(Z, zpct)
+        print(f"  z-prefilter: keep z >= p{zpct} -> {keep.sum()}/{len(Z)} "
+              f"({keep.mean()*100:.0f}%) detections")
+        P, F, A = P[keep], F[keep], A[keep]
+    else:
+        print(f"  no z-prefilter: all {len(Z)} detections")
     acqs = sorted(np.unique(A).tolist())
     return {a: (P[A == a], F[A == a]) for a in acqs}, o
 
 
 def _track_one(job):
-    acq, P, F, params = job
-    from track_rts import track_kf_rts, tracks_rts
-    recs = track_kf_rts(P, F, **params)
-    return acq, tracks_rts(recs), len(P)
+    acq, P, F, tparams, smoother = job
+    from track_rts import track_kf_rts
+    recs = track_kf_rts(P, F, **tparams)
+    return acq, _smooth(recs, smoother), len(P)
 
 
-def run(mode="reference-matched", workers=MAX_WORKERS, acqs=None):
-    params = MODES[mode]
+def run(mode="reference-config", workers=MAX_WORKERS, acqs=None):
+    cfg = MODES[mode]
+    tparams = {k: cfg[k] for k in TRACKER_KEYS}
+    smoother = cfg["smoother"]
     workers = max(1, min(int(workers), MAX_WORKERS))       # HARD CAP
-    det, _ = load_detections()
+    det, _ = load_detections(zpct=cfg["zpct"])
     if acqs:
         det = {a: v for a, v in det.items() if a in acqs}
-    jobs = [(a, P, F, params) for a, (P, F) in sorted(det.items())]
-    print(f"  mode={mode} {params}")
+    jobs = [(a, P, F, tparams, smoother) for a, (P, F) in sorted(det.items())]
+    print(f"  mode={mode}: filter {tparams}, smoother={smoother}")
     print(f"  {len(jobs)} acquisition(s), workers={workers} (hard cap {MAX_WORKERS}), "
           f"load-pause at {LOAD_PAUSE}")
 
@@ -160,7 +187,7 @@ def validate(tracks_by_acq):
     m, d, _ = segdirs_from_tracks([{"positions": p, "acq_index": 0} for p, _ in tr])
     cl, cn = coherence_map(m, d); cl = float(cl[cn >= 4].mean())
     rsp, rang = phys_plausibility([(p, np.arange(len(p))) for p in ref])
-    print("\n  ACQ-0 VALIDATION (RTS-smoothed, vs reference tracks on identical detections)")
+    print("\n  ACQ-0 VALIDATION (smoothed tracks vs reference tracks on identical detections)")
     print(f"    {'':<22} {'trk':>4} {'mean':>5} {'max':>4} {'spMed':>6} {'turn':>5} {'cl':>5} {'dirAg':>6}")
     print(f"    {'reference':<22} {len(ref):>4} {10.3:>5.1f} {68:>4} "
           f"{np.median(rsp):>6.1f} {np.median(rang):>5.1f} {0.73:>5.2f} {'-':>6}")
