@@ -206,22 +206,32 @@ untouched. That critique is accepted. Two reference-independent tests were added
   than a frame-shuffled null**. (Restricted to linked detections — the un-trackable ~68% have no track
   to predict them, which is why the same test over *all* detections looks like chance.)
 - **Synthetic link precision/recall (planted ground truth, matched to acq-0 stats).** On simulated
-  bubbles with known links at acq-0's density/speed/length/noise: **link precision 0.86 ± 0.02**
-  (≈14% of the tracker's links are wrong) and **recall 0.61 ± 0.02** (misses ≈39% of true links,
+  bubbles with known links at acq-0's density/speed/length/noise: **link precision 0.85 ± 0.01**
+  (≈15% of the tracker's links are wrong) and **recall 0.58 ± 0.02** (misses ≈42% of true links,
   mostly across gaps and in dense regions). Config carried over unchanged, so the 5 seeds are held-out
   realizations.
 
-**Honest limits of these numbers.** The simulation uses independent smooth trajectories + uniform
-noise (no vessel crossings/confluences, where linking is hardest), so **0.86 is likely optimistic**
-for real vasculature. There is still **no held-out real acquisition** and **no per-acq QC** — both
-require the 215-acq unblock. So the standing claim is downgraded accordingly.
+- **Vessel-crossing stress (now measured, not assumed).** `track_sim_validate.py` plants engineered
+  crossing pairs — two bubbles routed through one point at one frame with headings ≥60° apart, the
+  near-miss confusers where a gating tracker can swap identities. Sweeping crossing density (baseline
+  ≈345 bubbles): precision **0.85 → 0.84 → 0.81 → 0.80** at **0 / 20 / 50 / 100** crossing pairs.
+  Even a *heavy* load (100 pairs ≈ 200 extra bubbles, ~37% of the population) costs only ~5 points of
+  precision, and recall is flat (~0.58). So the mis-link rate the Mahalanobis gate incurs under
+  crossings is bounded and modest — the earlier "0.86 is optimistic" worry is real but small.
+
+**Honest limits of these numbers.** The crossing model still forces a clean geometric intersection,
+not a true confluence with shared vessel walls and correlated flow; and there is still **no held-out
+real acquisition** and **no per-acq QC** — both require the 215-acq unblock. So the standing claim is
+downgraded accordingly: reproduces the reference + link precision **0.85 crossing-free, ≥0.80 under a
+heavy synthetic crossing load**; not yet accuracy-validated on real held-out data.
 
 ## Bottom line (calibrated)
 
 We are back to independently tracked bubble trajectories with a principled Kalman + Gaussian-smooth
 tracker that (a) reproduces the reference tracker on identical acq-0 detections across count, length,
-turning, and coverage, and (b) shows **link precision ≈0.86 / recall ≈0.61 on matched synthetic
-ground truth** — the first accuracy evidence that does not lean on the reference. It is **not** yet
+turning, and coverage, and (b) shows **link precision ≈0.85 / recall ≈0.58 on matched synthetic
+ground truth, holding ≥0.80 under a heavy synthetic vessel-crossing load** — the first accuracy
+evidence that does not lean on the reference. It is **not** yet
 "validated for accuracy": that needs held-out real acquisitions, per-acq QC, and link-level checks on
 real crossings — all gated on the 215-acq unblock (`mb-4yw`, watched by
 `scripts/monitor_data_unblock.sh`). The scale-up must run a **frozen protocol** (config + metrics +
@@ -238,5 +248,6 @@ max_gap=3, min_len=5, Gaussian σ=2) and `high-coverage`, both unchanged from he
    silently tracking them.
 2. **Held-out acquisitions** — tune nothing; report the acq-0 metrics on a random held-out subset of
    acqs and quote the degradation.
-3. **Link-level accuracy** — extend `track_sim_validate.py` with vessel-crossing geometry, and (if any
-   labeled/paired detections exist) report real link precision/recall, not only synthetic.
+3. **Link-level accuracy** — synthetic vessel-crossing geometry is now in `track_sim_validate.py`
+   (crossing-density sweep above); on arrival, add real link precision/recall if any labeled/paired
+   detections exist, not only synthetic.

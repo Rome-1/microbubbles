@@ -54,29 +54,60 @@ def acq0_stats():
                 len_mean=float(lens.mean()), len_min=int(lens.min()), len_max=int(lens.max()))
 
 
-def simulate(st, seed=0, p_detect=0.85, loc_noise=0.12):
+def _trajectory(st, rng, dt, direction=None):
+    """One curved constant-ish-speed trajectory: returns (life, positions (life,3)) centered at
+    origin (pos[0]=0). Heading noise ~8 deg/frame reproduces the acq-0 turning distribution."""
+    life = int(np.clip(rng.exponential(st["len_mean"]), st["len_min"], st["len_max"]))
+    spd = np.clip(rng.lognormal(np.log(st["speed_med"]), 0.6), st["speed_lo"], 3 * st["speed_hi"])
+    if direction is None:
+        direction = rng.normal(size=3)
+    v = direction / (np.linalg.norm(direction) + 1e-9) * spd * dt                 # mm/frame
+    pos = np.zeros(3); out = []
+    for _ in range(life):
+        out.append(pos.copy())
+        v = v + rng.normal(0, np.linalg.norm(v) * 0.14, 3); pos = pos + v         # curvature
+    return life, np.array(out)
+
+
+def _emit(traj, f0, bid, p_detect, loc_noise, rng, Ps, Fs, Is):
+    """Sample a trajectory into (noisy, dropout-thinned) detections tagged with bubble id `bid`."""
+    for k, p in enumerate(traj):
+        if rng.random() < p_detect:
+            Ps.append(p + rng.normal(0, loc_noise, 3)); Fs.append(f0 + k); Is.append(bid)
+
+
+def simulate(st, seed=0, p_detect=0.85, loc_noise=0.12, n_cross=0, cross_ang=np.pi / 3):
     """Plant bubbles matched to acq-0 stats. Returns detections P (N,3), frames F (N,), and
-    identity ID (N,) where ID>=0 is a bubble id and ID=-1 is spurious noise."""
+    identity ID (N,) where ID>=0 is a bubble id and ID=-1 is spurious noise.
+
+    n_cross>0 additionally plants that many ENGINEERED CROSSING PAIRS: two bubbles routed through
+    a shared point at a shared frame, with headings forced at least `cross_ang` apart. These are
+    the near-miss confusers absent from the independent-motion baseline — the case where a gating
+    tracker can swap identities. Crossing bubbles displace noise fill (density stays acq-0-matched)."""
     rng = np.random.default_rng(seed)
     T = st["nframes"]; lo, hi = st["lo"], st["hi"]
     # bubbles: choose count so DETECTED on-track density matches the reference linked/frame
     n_bub = int(round(st["linked_per_frame"] * T / (st["len_mean"] * p_detect)))
     dt = 1.0 / FPS
     Ps, Fs, Is = [], [], []
-    for b in range(n_bub):
-        life = int(np.clip(rng.exponential(st["len_mean"]), st["len_min"], st["len_max"]))
+    bid = 0
+    for _ in range(n_bub):
+        life, traj = _trajectory(st, rng, dt)
         f0 = rng.integers(0, max(1, T - life))
-        # constant-ish velocity with small heading noise (~8 deg/frame => turning match)
-        spd = np.clip(rng.lognormal(np.log(st["speed_med"]), 0.6), st["speed_lo"], 3 * st["speed_hi"])
-        v = rng.normal(size=3); v /= np.linalg.norm(v) + 1e-9; v *= spd * dt      # mm/frame
-        pos = lo + (hi - lo) * rng.random(3)
-        for k in range(life):
-            f = f0 + k
-            if rng.random() < p_detect:                 # per-frame dropout
-                Ps.append(pos + rng.normal(0, loc_noise, 3)); Fs.append(f); Is.append(b)
-            # small random heading change (curvature)
-            dv = rng.normal(0, np.linalg.norm(v) * 0.14, 3)
-            v = v + dv; pos = pos + v
+        _emit(traj + (lo + (hi - lo) * rng.random(3)), f0, bid, p_detect, loc_noise, rng, Ps, Fs, Is)
+        bid += 1
+    # engineered crossings: both members pass through meeting point m at meeting frame fm
+    for _ in range(n_cross):
+        m = lo + (hi - lo) * rng.random(3); fm = rng.integers(0, T)
+        d0 = rng.normal(size=3); d0 /= np.linalg.norm(d0) + 1e-9
+        perp = rng.normal(size=3); perp -= perp.dot(d0) * d0; perp /= np.linalg.norm(perp) + 1e-9
+        d1 = np.cos(cross_ang) * d0 + np.sin(cross_ang) * perp   # forced >= cross_ang from d0
+        for direction in (d0, d1):
+            life, traj = _trajectory(st, rng, dt, direction=direction)
+            k_meet = int(rng.integers(0, life))                  # which vertex sits on m
+            f0 = int(np.clip(fm - k_meet, 0, max(0, T - life)))
+            _emit(traj + (m - traj[k_meet]), f0, bid, p_detect, loc_noise, rng, Ps, Fs, Is)
+            bid += 1
     # spurious noise detections to hit acq-0's total density
     n_noise = int((st["dets_per_frame"] * T) - len(Ps))
     for _ in range(max(0, n_noise)):
@@ -169,6 +200,26 @@ def main():
           f"recall {np.mean(Rs):.2f} +/- {np.std(Rs):.2f}")
     print("  precision = fraction of the tracker's links that are correct (bounds the mis-link rate);")
     print("  recall = fraction of true links recovered. Reference-independent — no reference used.")
+
+    n_bub0 = int(round(st["linked_per_frame"] * st["nframes"] / (st["len_mean"] * 0.85)))
+    print("\nVESSEL-CROSSING STRESS (engineered near-miss confusers absent from the baseline above)")
+    print("  Plants N crossing pairs (two bubbles through one point/frame, headings >= 60 deg apart).")
+    print(f"  Baseline is ~{n_bub0} bubbles, so N=100 pairs (200 bubbles) is a HEAVY crossing load.")
+    print("  Precision here bounds the mis-link rate UNDER crossings — the regime that breaks gating.")
+    print(f"  {'crossings':>9} {'prec':>6} {'rec':>6} {'F1':>6}")
+    for n_cross in (0, 20, 50, 100):
+        Ps, Rs = [], []
+        for seed in range(5):
+            P, F, ID = simulate(st, seed=seed, n_cross=n_cross)
+            recs = track_kf_rts(P, F, **CFG)
+            G = gt_links(F, ID); Pl = pred_links(recs, P)
+            tp = len(Pl & G)
+            Ps.append(tp / max(1, len(Pl))); Rs.append(tp / max(1, len(G)))
+        prec = np.mean(Ps); rec = np.mean(Rs)
+        f1 = 2 * prec * rec / max(1e-9, prec + rec)
+        print(f"  {n_cross:>9} {prec:>6.2f} {rec:>6.2f} {f1:>6.2f}")
+    print("  If precision holds flat across crossing density, gating resists identity swaps at the")
+    print("  crossings; a downward slope quantifies how much the 0.86 baseline was crossing-free luck.")
 
 
 if __name__ == "__main__":
