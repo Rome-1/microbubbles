@@ -128,6 +128,55 @@ def _twice(beamformed: str, tag: str) -> dict:
     return rep
 
 
+gpu_image = (
+    modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.11")
+    .apt_install("git")
+    .pip_install("h5py==3.11.0", "numpy<2.0", "scipy==1.13.1", "tqdm==4.66.4",
+                 "torch==2.4.1", "cupy-cuda12x==13.3.0", "mach-beamform")
+    .pip_install(
+        f"ultratrace-ulm-pipeline @ git+https://github.com/alephneuro/microbubbles.git@{POSTFIX_SHA}",
+        extra_options="--no-deps",
+    )
+)
+
+
+@app.function(image=gpu_image, gpu="A100-80GB", timeout=3 * 3600, memory=262144, cpu=16.0,
+              volumes={"/root/data": vol})
+def beamform_twice(num_acqs: int = 1) -> dict:
+    """Is the beamforming stage itself reproducible? The bug report assumed it was
+    ('identical beamformed compounds across runs'), and the SVD-stage measurements can
+    only account for ~6% of the reported disagreement -- so this checks the assumption
+    directly: same command, same input, two runs, element-wise compare."""
+    import h5py
+    import numpy as np
+
+    vol.reload()
+    outs = []
+    for tag in ("a", "b"):
+        out = f"{DATA_ROOT}/determinism_bf_{tag}.h5"
+        cmd = ["ultratrace-ulm", "beamform",
+               "--input", f"{DATA_ROOT}/sanitized_neutral_ultratrace.h5",
+               "--output", out, "--num-acqs", str(num_acqs), "--spatial-tgc"]
+        print("+ " + " ".join(cmd), flush=True)
+        subprocess.run(cmd, check=True)
+        outs.append(out)
+    vol.commit()
+
+    with h5py.File(outs[0], "r") as fa, h5py.File(outs[1], "r") as fb:
+        ka = sorted(fa["acquisitions"].keys(), key=int)[0]
+        kb = sorted(fb["acquisitions"].keys(), key=int)[0]
+        a = np.asarray(fa[f"acquisitions/{ka}/meta/compound_image"], dtype=np.complex64)
+        b = np.asarray(fb[f"acquisitions/{kb}/meta/compound_image"], dtype=np.complex64)
+    diff = np.abs(a - b)
+    rep = {"shape": list(a.shape),
+           "bit_identical": bool(np.array_equal(a, b)),
+           "max_abs_diff": float(diff.max()),
+           "mean_abs_diff": float(diff.mean()),
+           "rel_mean_diff": float(diff.mean() / (np.abs(a).mean() + 1e-20))}
+    print("BEAMFORM_COMPARE " + repr(rep), flush=True)
+    return rep
+
+
 @app.function(image=_image(PREFIX_SHA), timeout=3 * 3600, memory=131072, cpu=16.0,
               volumes={"/root/data": vol})
 def prefix_twice(beamformed: str = "pristine_bf_1.h5") -> dict:
