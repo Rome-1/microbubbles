@@ -89,7 +89,14 @@ acquisition, second run at a different BLAS thread count:
 | revision | detections A / B | exact voxel overlap | median NN | p90 NN |
 |---|---|---|---|---|
 | `6ed4116` (pre-#4, complex64) | 38,282 / 38,268 | **93.76%** | 0.97 µm | 3.1 µm |
-| `1939006` (HEAD, complex128) | _pending_ | _pending_ | | |
+| `1939006` (HEAD, complex128) | 43,039 / 43,040 | **99.998%** | 0 | 0.004 µm |
+
+PR #4 works: post-merge the two runs differ by a single detection out of 43,040. Note the
+second column too — the fix does not only stabilise the detection field, it **changes** it,
+from 38.3k to 43.0k detections (+12%). complex64 was over-suppressing the retained
+blood/bubble subspace, which is the same effect measured in `docs/ideation/15` (mb-a0a).
+Anyone comparing results across this commit is comparing two different detection fields, not
+two runs of the same one.
 
 The detection counts match the report (~38–39k), but the disagreement does not: the ~6% of
 detections that differ are displaced by **~1 µm** — sub-voxel localization landing either

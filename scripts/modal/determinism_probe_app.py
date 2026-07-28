@@ -191,6 +191,54 @@ def centroids(acq_h5: str = "beamformed/base60_refs/acq_0000.h5",
     return out
 
 
+@app.function(image=image, timeout=3 * 3600, memory=131072, cpu=16.0,
+              volumes={"/root/data": vol})
+def centroid_survey(acqs: list[int] | None = None, frame_rate: float = 222.0,
+                    tissue_freq_hz: float = 100.0) -> dict:
+    """Does the adaptive cutoff EVER fire on this dataset, or only on acq 0?
+
+    Runs the shipped score over several acquisitions (full volume, baseline config only)
+    and reports the highest mode centroid against the tissue boundary."""
+    import json
+    import sys
+
+    sys.path.insert(0, "/workspace")
+    import numpy as np
+
+    from ultratrace_ulm.h5_io import open_h5, acq_keys, load_compound
+
+    ns: dict = {}
+    exec(PROBE, ns)
+    vol.reload()
+
+    out: dict = {"tissue_freq_hz": tissue_freq_hz, "acqs": {}}
+    for acq in (acqs or [0, 55, 111, 222]):
+        path = f"{DATA_ROOT}/beamformed/base60_refs/acq_{acq:04d}.h5"
+        with open_h5(path) as h5:
+            aid = acq_keys(h5)[0]
+            comp = load_compound(h5, aid)
+        n_frames = int(comp.shape[0])
+        matrix = np.asarray(comp, dtype=np.complex64).reshape(n_frames, -1)
+        del comp
+        rec = {}
+        for variant in ("v0_shipped", "v2_ours"):
+            precision, scorer = ns["VARIANTS"][variant]
+            c = scorer(ns["modes"](matrix, precision), frame_rate)
+            above = np.where(c > tissue_freq_hz)[0]
+            rec[variant] = {"cutoff": ns["cutoff_from_centroid"](c, tissue_freq_hz, n_frames),
+                            "fallback": bool(len(above) == 0),
+                            "centroid_max_hz": round(float(c.max()), 2),
+                            "n_modes_above": int(len(above))}
+        del matrix
+        out["acqs"][str(acq)] = rec
+        print(f"[acq {acq}] {rec}", flush=True)
+
+    with open(f"{DATA_ROOT}/determinism_centroid_survey.json", "w") as fh:
+        json.dump(out, fh, indent=2)
+    vol.commit()
+    return out
+
+
 @app.function(image=image, timeout=3 * 3600, memory=65536, cpu=16.0,
               volumes={"/root/data": vol})
 def probe(acq_h5: str = "beamformed/base60_refs/acq_0000.h5",
