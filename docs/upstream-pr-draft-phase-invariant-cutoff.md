@@ -14,9 +14,15 @@ Adaptive SVD cutoff: score modes phase-invariantly, and keep the complex128 Gram
 
 ## Body
 
-#4 fixed the precision half of #2 — the eigendecomposition now runs in complex128, and on
-one in-vivo acquisition that is measurably what removes the cross-run jitter (numbers
-below). Two things are left over from the same code path.
+#4 does what it says: running `track` twice on one beamformed acquisition (bug-report recipe,
+different BLAS thread counts) goes from **93.8%** detection agreement before the merge to
+**99.998%** after — 1 detection out of 43,040. Two things are left over from the same code
+path.
+
+Worth knowing alongside that: the same change moves the detection count from 38,282 to
+43,039 on identical input (+12%). complex64 was over-suppressing the retained blood/bubble
+subspace, so results either side of this commit are two different detection fields, not two
+runs of one.
 
 **1. The mode score still depends on a convention the eigensolver is free to change.**
 
@@ -61,12 +67,13 @@ matching the declared complex64 output.
 cutoff across repeated calls, cutoff unchanged under a 1e-6 (float32-epsilon) input
 perturbation, and reproducible `filter_svd_3d(method="adaptive")` output.
 
-**One observation, no change requested.** On `sanitized_neutral_ultratrace.h5` acq 0, no
-mode's centroid reaches the default 100 Hz tissue boundary (max ≈ 70 Hz), so
-`--svd-method adaptive` silently takes the "10% of frames" fallback — it is a fixed cutoff
-of 70 on this data, not an adaptive one. That may be intended for this recording, but it
-does mean the adaptive path is not exercised by the public sample, and it is why the
-cutoff itself was never the source of the run-to-run variation in #2.
+**One observation, no change requested.** On `sanitized_neutral_ultratrace.h5`, no mode's
+centroid reaches the default 100 Hz tissue boundary on any acquisition we checked (acqs 0,
+30, 59, 111, 222; max per acquisition 69.6–72.9 Hz), so `--svd-method adaptive` silently
+takes the "10% of frames" fallback — it is a fixed cutoff of 70 on this data, not an adaptive
+one. That may be intended for this recording, but it does mean the adaptive path is not
+exercised by the public sample, and it is why the cutoff itself was not the source of the
+run-to-run variation in #2 (what #4 fixed is the retained subspace at a fixed cutoff).
 
 ---
 

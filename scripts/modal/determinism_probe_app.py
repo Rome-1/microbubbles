@@ -193,7 +193,7 @@ def centroids(acq_h5: str = "beamformed/base60_refs/acq_0000.h5",
 
 @app.function(image=image, timeout=3 * 3600, memory=131072, cpu=16.0,
               volumes={"/root/data": vol})
-def centroid_survey(acqs: list[int] | None = None, frame_rate: float = 222.0,
+def centroid_survey(acqs: str = "0,55,111,222", frame_rate: float = 222.0,
                     tissue_freq_hz: float = 100.0) -> dict:
     """Does the adaptive cutoff EVER fire on this dataset, or only on acq 0?
 
@@ -212,7 +212,7 @@ def centroid_survey(acqs: list[int] | None = None, frame_rate: float = 222.0,
     vol.reload()
 
     out: dict = {"tissue_freq_hz": tissue_freq_hz, "acqs": {}}
-    for acq in (acqs or [0, 55, 111, 222]):
+    for acq in [int(a) for a in acqs.split(",") if a.strip()]:
         path = f"{DATA_ROOT}/beamformed/base60_refs/acq_{acq:04d}.h5"
         with open_h5(path) as h5:
             aid = acq_keys(h5)[0]

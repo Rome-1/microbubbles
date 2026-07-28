@@ -59,6 +59,11 @@ close to the 100 Hz tissue boundary:
 | `v1_pr4` | 70.7 | 0 | 70 (fallback) |
 | `v2_ours` | 70.4 | 0 | 70 (fallback) |
 
+This is not an acq-0 quirk. Across the five acquisitions available as beamformed shards
+(0, 30, 59, 111, 222) the highest mode centroid ranges **69.6–72.9 Hz** with the shipped
+score and **68.8–73.2 Hz** with the phase-invariant one — never within 25 Hz of the
+boundary, always the fallback.
+
 `spectral_centroid_cutoff` therefore returns its `10% of frames` fallback — a constant 70 —
 for every variant and every perturbation. **On this dataset `--svd-method adaptive` is a
 fixed cutoff of 70, not an adaptive one**, and a cutoff that cannot move cannot be the
@@ -105,10 +110,25 @@ orders of magnitude further, with only 14% agreement.
 
 **We could not reproduce the reported severity.** Starting from a fixed beamformed
 acquisition, the pre-fix code is already ~94% reproducible at voxel resolution and
-essentially identical in position. Whatever produced 14% overlap therefore did not enter at
-the SVD/detection stage from a fixed input — the remaining candidates are the beamforming
-stage itself differing between the two runs, or the GPU path (upstream's own note on the
-issue says they removed a randomized-SVD GPU tracking path, which would fit).
+essentially identical in position. Two candidate explanations were then checked and both
+are ruled out:
+
+- **Beamforming is not the hidden variable.** Two runs of the pristine `beamform` command on
+  the same raw input produce a **bit-identical** compound (700×25×225×378, max abs
+  difference exactly 0.0) — the assumption the bug report made holds.
+- **The randomized-SVD path upstream mentioned is not in the public code.** `svd.py` maps the
+  `gpu`/`gpu_full`/`randomized` method names onto the same deterministic `fast` covariance
+  projection, and the public package has no GPU SVD module at all. Whatever randomized path
+  they removed lived in their private repo, so it cannot explain a run made from the public
+  CLI.
+
+So the gap stands: on the public code, from a fixed input, in this environment, the pre-fix
+non-determinism is **~6% of detections displaced by ~1 µm**, not ~86% displaced by 0.27 mm.
+Either the original measurement carried an environment-specific factor (a different
+BLAS/threading build is the obvious candidate — the c64 path's sensitivity is exactly the
+kind of thing that varies by library), or the two runs it compared differed in more than the
+seed. Closing that would need the original run's artifacts; it does not change any
+conclusion below.
 
 ### 4. The phase defect is real, and PR #4 does not address it
 
@@ -130,10 +150,14 @@ where LAPACK and cuSOLVER chose different cutoffs and the track counts came out 
 - Issue #2 is closed for a real reason: PR #4 makes the decomposition double-precision, and
   that is measurably what removes the reduction-order jitter (99.44% → 100% at the component
   level). Nothing about the merge is wrong.
-- But the *stated mechanism* is not the one operating on this data, and the reported
-  severity (14% overlap, 0.27 mm) does not reproduce from a fixed beamformed input at either
-  revision. Before claiming #2 is fully understood, the two-run repro needs to be rerun with
-  the **beamforming inside the loop**.
+- But the *stated mechanism* is not the one operating on this data: the cutoff is a constant
+  70 on every acquisition tested, so nothing about cutoff selection can move detections. What
+  PR #4 actually fixed is eigenvector instability in the **retained subspace** at that fixed
+  cutoff.
+- The reported severity (14% overlap, 0.27 mm) does not reproduce: pre-fix is ~94%
+  reproducible with ~1 µm displacements, beamforming is bit-identical across runs, and the
+  randomized path upstream referred to is not in the public code. That gap is unexplained and
+  is flagged as unexplained.
 - One defect from the same code path survives the merge: the mode score is phase-dependent,
   so the cutoff is a function of the linear-algebra library's phase convention rather than of
   the data. That is a latent CPU-vs-GPU divergence, not a cross-run one — which is exactly
