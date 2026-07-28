@@ -1,0 +1,111 @@
+diff --git a/ultratrace_ulm/svd.py b/ultratrace_ulm/svd.py
+index e805d25..d22683d 100644
+--- a/ultratrace_ulm/svd.py
++++ b/ultratrace_ulm/svd.py
+@@ -13,6 +13,42 @@ def _component_count(cutoff: float | int | None, n_frames: int) -> int:
+     return int(round(value))
+ 
+ 
++def _temporal_gram(matrix: np.ndarray, subtract_mean: bool = True,
++                   chunk: int = 300_000) -> np.ndarray:
++    """Mean-subtracted temporal Gram ``x xᴴ`` accumulated in complex128.
++
++    Accumulating the small (frames, frames) Gram from complex64 chunks keeps the
++    decomposition in double precision without ever materialising a complex128 copy
++    of the (frames, voxels) matrix -- that copy is 16 bytes/voxel-frame (~24 GB for
++    a 700-frame in-vivo acquisition), which undoes the streaming memory work.
++    """
++    n_frames = int(matrix.shape[0])
++    mean = matrix.mean(axis=0, keepdims=True) if subtract_mean else None
++    gram = np.zeros((n_frames, n_frames), dtype=np.complex128)
++    for start in range(0, matrix.shape[1], chunk):
++        block = matrix[:, start:start + chunk]
++        if mean is not None:
++            block = block - mean
++        block = block.astype(np.complex128)
++        gram += block @ block.conj().T
++    return gram
++
++
++def mode_centroids(u: np.ndarray, frame_rate_hz: float) -> np.ndarray:
++    """Power-weighted mean |frequency| (Hz) of each temporal mode in ``u``.
++
++    Uses the full complex spectrum, so the value depends only on the mode itself and
++    not on the unit phase an eigensolver happened to attach to it (see #2 and the
++    note in ``spectral_centroid_cutoff``).
++    """
++    n_frames = int(u.shape[0])
++    freqs = np.abs(np.fft.fftfreq(n_frames, d=1.0 / frame_rate_hz))
++    spectrum = np.abs(np.fft.fft(u, axis=0)) ** 2   # (frames, modes)
++    spectrum[0, :] = 0.0                            # exclude DC
++    total = spectrum.sum(axis=0)
++    return (freqs[:, None] * spectrum).sum(axis=0) / np.where(total > 0, total, 1.0)
++
++
+ def spectral_centroid_cutoff(
+     matrix: np.ndarray,
+     frame_rate_hz: float,
+@@ -25,26 +61,25 @@ def spectral_centroid_cutoff(
+     ``tissue_freq_hz`` (Ghosh et al., PNAS 2025). Falls back to 10% of frames.
+     ``matrix`` is the (frames, voxels) temporal matrix.
+ 
+-    The eigendecomposition runs in double precision (complex128): the
+-    complex64 Gram matrix has near-degenerate eigenvalues whose eigenvectors
+-    are not reproducible across runs, which would make the selected cutoff --
+-    and therefore every downstream detection -- non-deterministic. complex128
+-    resolves the eigenvalue gaps and yields bit-stable results.
++    Two properties are load-bearing for determinism (see #2):
++
++    * The eigendecomposition runs in double precision (complex128). The complex64
++      Gram matrix has near-degenerate eigenvalues whose eigenvectors are not
++      reproducible across runs, which makes the selected cutoff -- and therefore
++      every downstream detection -- non-deterministic.
++    * The per-mode score is PHASE-INVARIANT. A Hermitian eigensolver defines each
++      eigenvector only up to an arbitrary unit phase, and different LAPACK builds
++      (and cuSOLVER, for the GPU path) return different phases for the same input.
++      Scoring ``|rfft(u.real)|**2`` measures the real part alone, so the same mode
++      scores differently under a different phase convention and the cutoff moves.
++      The full complex spectrum ``|fft(u)|**2``, with the centroid taken over
++      ``|f|``, is invariant to that phase -- and is also the physically correct
++      frequency content of a complex (signed-Doppler) mode.
+     """
+     n_frames = int(matrix.shape[0])
+-    x = np.asarray(matrix, dtype=np.complex128)
+-    x = x - x.mean(axis=0, keepdims=True)
+-    cov = x @ x.conj().T
+-    evals, u = np.linalg.eigh(cov)
++    evals, u = np.linalg.eigh(_temporal_gram(matrix))
+     u = u[:, np.argsort(evals)[::-1]]
+-    freqs = np.fft.rfftfreq(n_frames, d=1.0 / frame_rate_hz)
+-    centroid = np.zeros(n_frames)
+-    for i in range(n_frames):
+-        spectrum = np.abs(np.fft.rfft(u[:, i].real)) ** 2
+-        spectrum[0] = 0.0  # exclude DC
+-        total = spectrum.sum()
+-        if total > 0:
+-            centroid[i] = float(np.sum(freqs * spectrum) / total)
++    centroid = mode_centroids(u, frame_rate_hz)
+     above = np.where(centroid > tissue_freq_hz)[0]
+     return int(above[0]) if len(above) else max(1, round(n_frames * 0.1))
+ 
+@@ -99,14 +134,15 @@ def filter_svd_3d(
+     elif normalized_method == "fast":
+         # Double precision: the complex64 Gram matrix has near-degenerate
+         # eigenvalues whose eigenvectors vary run-to-run, which shifts the
+-        # filtered magnitude and makes detections non-deterministic.
+-        m = np.asarray(matrix, dtype=np.complex128)
+-        cov = m @ m.conj().T
++        # filtered magnitude and makes detections non-deterministic. The Gram is
++        # accumulated in complex128 from complex64 chunks, so the decomposition is
++        # double-precision without a complex128 copy of the whole matrix.
++        cov = _temporal_gram(matrix, subtract_mean=False)
+         evals, u = np.linalg.eigh(cov)
+         u = u[:, np.argsort(evals)[::-1]]
+         stop = n_frames - high_remove if high_remove > 0 else n_frames
+-        uc = u[:, low:stop]
+-        filtered = uc @ (uc.conj().T @ m)
++        uc = np.asarray(u[:, low:stop], dtype=np.complex64)
++        filtered = uc @ (uc.conj().T @ matrix)
+     elif normalized_method == "full":
+         m = np.asarray(matrix, dtype=np.complex128)
+         u, s, vh = np.linalg.svd(m, full_matrices=False)
