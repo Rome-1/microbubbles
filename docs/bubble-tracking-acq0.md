@@ -282,8 +282,11 @@ synthetic link precision/recall measures, and that is now the only accuracy clai
 
 **Honest limits of these numbers.** The crossing model still forces a clean geometric intersection,
 not a true confluence with shared vessel walls and correlated flow; the simulation's regime is
-reference-calibrated, not independent; and there is still **no held-out real acquisition** and **no
-per-acq QC** — both require the 215-acq unblock. So the standing claim is downgraded again: reproduces
+reference-calibrated, not independent; and there is **no per-acq QC** yet. (Held-out *real*
+acquisitions are no longer blocked — `reference_dissolve.py` / `reference_holdout_eval.py`, landed
+alongside this correction, score the frozen operating point against the reference's own link labels
+on 15 unseen acqs; those numbers carry their own optimism caveat and are reported separately.) So the
+standing claim is downgraded again: reproduces
 the reference + link precision **0.85 crossing-free, ≥0.79 under a heavy synthetic crossing load with
 clutter held fixed**; the held-out-prediction test is retired as evidence of estimation quality; not
 accuracy-validated on real held-out data.
