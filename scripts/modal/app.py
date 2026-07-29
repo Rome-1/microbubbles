@@ -389,6 +389,72 @@ def download(url: str = SAMPLE_URL, max_attempts: int = 80) -> dict:
             "complete": complete, "attempts": attempt + 1, "seconds": round(time.time() - t0, 1)}
 
 
+@app.function(image=cpu_image, timeout=12 * 3600, memory=8192, cpu=2.0,
+              volumes={"/root/data": vol})
+def download_corrected(url: str = SAMPLE_URL, max_attempts: int = 40) -> dict:
+    """Fetch the CORRECTED sample to a NEW path -- do not touch the old download.
+
+    Upstream replaced the object at this URL on 2026-07-11 (commit 23c49e57) without
+    changing the filename: the previous export came from a SINGLE-ROW acquisition, so the
+    receive aperture had no elevation extent and beamforming to 25 planes produced
+    +-y mirror-symmetric warps of the center plane whose detections "would not link into
+    3D tracks". The replacement is the 8-row re-export: 216 acquisitions x 240 frames,
+    which is exactly what the reference artifact reports (`n_acquisitions: 216`,
+    `frames_per_acq: 240`).
+
+    Everything we have processed so far came from the retracted export (223 acqs x ~700
+    frames), which is why our detections score at chance against the reference's.
+
+    Writing to a separate filename on purpose: `download` resumes by comparing on-disk size
+    to Content-Length, so pointing it at the existing 223-acq file would either corrupt it
+    or -- since the stale file is LARGER than the corrected one -- silently report
+    "complete" and leave the wrong data in place.
+    """
+    import os
+    import sys
+    import time
+
+    sys.path.insert(0, "/workspace")
+    from ultratrace_ulm.download import _remote_size, download_sample
+
+    _ensure_root()
+    dest = _guard(f"{DATA_ROOT}/sanitized_neutral_ultratrace_216.h5")
+    total = _remote_size(url)
+    t0 = time.time()
+    size = os.path.getsize(dest) if os.path.exists(dest) else 0
+    print(f"[download216] remote {(total or 0)/2**30:.1f} GiB -> {dest} "
+          f"(have {size/2**30:.1f} GiB)", flush=True)
+    for attempt in range(max_attempts):
+        if total and size >= total:
+            break
+        try:
+            download_sample(url, dest)
+        except Exception as e:  # noqa: BLE001 - network drop; retry
+            print(f"[download216] attempt {attempt} dropped: {e}", flush=True)
+        vol.commit()
+        new = os.path.getsize(dest)
+        print(f"[download216] attempt {attempt}: {new/2**30:.1f}/{(total or 0)/2**30:.1f} GiB "
+              f"({time.time()-t0:.0f}s)", flush=True)
+        if new == size and (not total or new < total):
+            time.sleep(2)
+        size = new
+    rep = {"dest": dest, "GiB": round(size / 2**30, 2),
+           "total_GiB": round((total or 0) / 2**30, 2),
+           "complete": bool(total and size >= total), "seconds": round(time.time() - t0, 1)}
+    if rep["complete"]:
+        import h5py
+        with h5py.File(dest, "r") as h5:
+            keys = sorted(h5["acquisitions"].keys(), key=int)
+            rep["n_acquisitions"] = len(keys)
+            first = h5[f"acquisitions/{keys[0]}"]
+            for name in ("iq", "data", "iq_data"):
+                if name in first:
+                    rep["acq0_shape"] = list(first[name].shape)
+                    break
+        print(f"[download216] verified: {rep}", flush=True)
+    return rep
+
+
 def _build_config(h5, elev_planes: int):
     import sys
 
