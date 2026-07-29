@@ -191,20 +191,26 @@ load ~67): every worker `os.nice(15)`s itself and pins BLAS to 1 thread, worker 
 exceeds 30 (renicing does not lower load average — pausing does). 216 acquisitions is embarrassingly
 parallel, which is exactly why the cap is not optional.
 
-## Reference-independent accuracy + adversarial re-check (2026-07-14)
+## Label-independent accuracy + adversarial re-check (2026-07-14, **corrected 2026-07-28**)
+
+> **Read the correction below before citing anything in this section.** A review pass on
+> `track_sim_validate.py` (2026-07-28) found four defects in the tests reported here: the held-out
+> prediction was not identity-restricted, the holdout was trivially easy, the only null was spatial
+> chance, and the crossing sweep varied clutter and crossings at the same time. All four are fixed;
+> the numbers below are the corrected ones, and two headline claims did not survive.
 
 An adversarial re-check (codex) made a correct and load-bearing point: **matching the reference — which
 is not ground truth — is not the same as validating tracking accuracy.** Reference-matching is
 circular (the config was chosen partly to match reference coverage/turning, then the match cited as
 validation); direction-agreement and bootstrap stability do not bound the mis-link rate; and the
 Gaussian σ=2 smoothing partly manufactures the matched turning/coherence while leaving associations
-untouched. That critique is accepted. Two reference-independent tests were added
+untouched. That critique is accepted. Two tests with labels the reference did not supply were added
 (`track_sim_validate.py`), both on **raw** detection links (smoothing-independent):
 
-- **Held-out linked-detection prediction (real acq-0).** Hold out 15% of the detections that form
-  tracks, re-track, predict their positions: **median error 0.32 mm, 64% within 0.5 mm, 9.2× better
-  than a frame-shuffled null**. (Restricted to linked detections — the un-trackable ~68% have no track
-  to predict them, which is why the same test over *all* detections looks like chance.)
+- **Held-out detection prediction (real acq-0).** ~~Median error 0.32 mm, 9.2× better than a
+  frame-shuffled null.~~ **This test was measuring almost nothing** — see *What the corrected
+  held-out test says* below. The 9.2× is real but the null was a straw man, and against a
+  competitive baseline the tracker does not win.
 - **Synthetic link precision/recall (planted ground truth, matched to acq-0 stats).** On simulated
   bubbles with known links at acq-0's density/speed/length/noise: **link precision 0.85 ± 0.01**
   (≈15% of the tracker's links are wrong) and **recall 0.58 ± 0.02** (misses ≈42% of true links,
@@ -214,24 +220,85 @@ untouched. That critique is accepted. Two reference-independent tests were added
 - **Vessel-crossing stress (now measured, not assumed).** `track_sim_validate.py` plants engineered
   crossing pairs — two bubbles routed through one point at one frame with headings ≥60° apart, the
   near-miss confusers where a gating tracker can swap identities. Sweeping crossing density (baseline
-  ≈345 bubbles): precision **0.85 → 0.84 → 0.81 → 0.80** at **0 / 20 / 50 / 100** crossing pairs.
-  Even a *heavy* load (100 pairs ≈ 200 extra bubbles, ~37% of the population) costs only ~5 points of
-  precision, and recall is flat (~0.58). So the mis-link rate the Mahalanobis gate incurs under
-  crossings is bounded and modest — the earlier "0.86 is optimistic" worry is real but small.
+  ≈344 bubbles): precision **0.85 → 0.83 → 0.81 → 0.79** at **0 / 20 / 50 / 100** crossing pairs, with
+  recall drifting 0.58 → 0.56. A *heavy* load (100 pairs ≈ 200 extra bubbles, ~37% of the population)
+  costs ~6 points of precision. Bounded and modest — but see the clutter correction below; the first
+  version of this sweep measured **0.85 → 0.80** because it was also thinning the clutter.
+
+### The four corrections (2026-07-28)
+
+**1. Held-out scoring was not identity-restricted.** The error was a `min` over *every* re-tracked
+trajectory whose frame span bracketed the held-out frame — so any wrong track passing nearby scored
+as a hit. It answered "is some bubble near here", not "does the right track predict this point".
+Scoring is now restricted to the re-tracked track that claims the held-out detection's immediate
+surviving neighbours (identity taken from the full-data tracking); if no such track survives, the
+point is **unscored** and reported as coverage, not rescued by a stranger.
+
+**2. The holdout was trivially easy.** An i.i.d. 15% per-detection holdout leaves nearly every
+held-out point bracketed by its own surviving neighbours one frame away — it measures **1-frame
+interpolation**, at or below the ~0.12 mm localization floor this doc identified earlier. Added a
+**contiguous-block holdout**: a run of `max_gap+1` = **4 consecutive frames** removed from each track,
+which exceeds the tracker's coasting budget, so the track *must* break and the prediction is a real
+extrapolation across the hole.
+
+**3. The null was a straw man.** Frame-shuffling measures distance to an arbitrary track in the
+volume — spatial chance. Added two competitive baselines on the same points and the same identities:
+**persistence** (last surviving raw detection of that bubble) and **tracker-free linear
+interpolation** between the surrounding **raw** detections (no motion model, no filter, no smoother).
+
+**4. Two dishonest lines.** The script printed "Reference-independent — no reference used" while
+`acq0_stats()` reads density, speed, track length and linked fraction out of the reference's own
+`tracks_smoothed`. The *labels* are independent (they are planted); the *regime* is
+**reference-calibrated**, and if the reference's regime is wrong this benchmark is wrong with it. The
+section heading above is renamed accordingly. Separately, the crossing sweep computed the clutter
+count as a **residual** against a fixed total density, so planting crossings **displaced** uniform
+noise: the clutter fraction fell from 66% to ~50% exactly as the crossing load rose, and the reported
+"0.85 → 0.80" was measured while the tracker's other adversary was being removed. Clutter is now held
+fixed at the crossing-free budget; crossings *add* detections (9,761 → 11,673).
+
+### What the corrected held-out test says — the tracker does not beat a straight line
+
+Medians on the points where all methods are defined (`track_sim_validate.py`, real acq-0 detections):
+
+| holdout | tracker (identity-restricted) | tracker-free raw interp | persistence | frame-shuffled null | coverage |
+|---|---|---|---|---|---|
+| i.i.d. 15% (1-frame) | 0.198 mm | **0.180 mm** | 0.258 mm | 2.817 mm | 81% |
+| contiguous 4-frame block | 0.302 mm | **0.212 mm** | 0.353 mm | 3.070 mm | 98% |
+
+**Tracker-free linear interpolation between the surrounding raw detections beats the tracker in both
+regimes** — by 10% on the easy holdout and by 30% on the hard one — even though under the block
+holdout the tracker is extrapolating across a 4-frame break while the interpolator is handed a
+bracket. The tracker's margin over *persistence* is 1.30× / 1.17×, and over spatial chance 14× / 10×.
+So: the old "0.32 mm, 9.2× better than null" was a real measurement of a test that could not fail.
+
+This is not a hidden defect in the Kalman filter; it is a restatement of what §3 of the residual
+investigation already found — per-frame steps (~0.12 mm) sit **at** the localization-jitter floor, so
+between two known raw detections there is nothing for a motion model to add. What it does mean is
+that **this test carries no evidence for the tracker's estimation machinery**. Its value has to come
+from *association* — deciding which detections belong to one bubble at all, which the interpolation
+baseline is simply handed for free (the baseline is given the correct identity by the full-data
+tracker; it is an oracle-association interpolator, not a rival tracker). Association is what the
+synthetic link precision/recall measures, and that is now the only accuracy claim carrying weight.
 
 **Honest limits of these numbers.** The crossing model still forces a clean geometric intersection,
-not a true confluence with shared vessel walls and correlated flow; and there is still **no held-out
-real acquisition** and **no per-acq QC** — both require the 215-acq unblock. So the standing claim is
-downgraded accordingly: reproduces the reference + link precision **0.85 crossing-free, ≥0.80 under a
-heavy synthetic crossing load**; not yet accuracy-validated on real held-out data.
+not a true confluence with shared vessel walls and correlated flow; the simulation's regime is
+reference-calibrated, not independent; and there is still **no held-out real acquisition** and **no
+per-acq QC** — both require the 215-acq unblock. So the standing claim is downgraded again: reproduces
+the reference + link precision **0.85 crossing-free, ≥0.79 under a heavy synthetic crossing load with
+clutter held fixed**; the held-out-prediction test is retired as evidence of estimation quality; not
+accuracy-validated on real held-out data.
 
 ## Bottom line (calibrated)
 
 We are back to independently tracked bubble trajectories with a principled Kalman + Gaussian-smooth
 tracker that (a) reproduces the reference tracker on identical acq-0 detections across count, length,
 turning, and coverage, and (b) shows **link precision ≈0.85 / recall ≈0.58 on matched synthetic
-ground truth, holding ≥0.80 under a heavy synthetic vessel-crossing load** — the first accuracy
-evidence that does not lean on the reference. It is **not** yet
+ground truth, holding ≥0.79 under a heavy synthetic vessel-crossing load with clutter held fixed** —
+the only accuracy evidence with labels the reference did not supply, though the *regime* it is scored
+in is still read out of the reference. The held-out-prediction test that used to sit beside it is
+**withdrawn as evidence**: corrected for identity and given a competitive baseline, tracker-free
+interpolation between the surrounding raw detections beats the tracker (0.180 vs 0.198 mm i.i.d.,
+0.212 vs 0.302 mm across a forced 4-frame gap). None of this is
 "validated for accuracy": that needs held-out real acquisitions, per-acq QC, and link-level checks on
 real crossings — all gated on the 215-acq unblock (`mb-4yw`, watched by
 `scripts/monitor_data_unblock.sh`). The scale-up must run a **frozen protocol** (config + metrics +
@@ -249,5 +316,9 @@ max_gap=3, min_len=5, Gaussian σ=2) and `high-coverage`, both unchanged from he
 2. **Held-out acquisitions** — tune nothing; report the acq-0 metrics on a random held-out subset of
    acqs and quote the degradation.
 3. **Link-level accuracy** — synthetic vessel-crossing geometry is now in `track_sim_validate.py`
-   (crossing-density sweep above); on arrival, add real link precision/recall if any labeled/paired
-   detections exist, not only synthetic.
+   (crossing-density sweep above, clutter held fixed); on arrival, add real link precision/recall if
+   any labeled/paired detections exist, not only synthetic. **Association, not interpolation, is the
+   thing to measure** — the corrected held-out test shows position prediction between known raw
+   detections is a straight-line problem at this noise floor, so any real-data test must score *which
+   detections were joined*, and every such test must carry a competitive baseline (tracker-free
+   interpolation, persistence), not only a shuffled null.
