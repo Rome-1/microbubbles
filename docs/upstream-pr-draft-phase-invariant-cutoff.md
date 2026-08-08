@@ -1,5 +1,31 @@
 # DRAFT upstream PR — phase-invariant adaptive SVD cutoff (follow-up to #4)
 
+> **SUPERSEDED 2026-07-31 — do not send this.** Upstream merged the same fix hours before we
+> would have: PR #5 (commit `b8ba5b7`, "Make the spectral centroid invariant to eigenvector
+> phase") replaces `|rfft(u.real)|²` with the two-sided power spectrum of the complex
+> eigenvector folded onto `|f|` — the identical change, arrived at independently, with the
+> same reasoning about the LAPACK representative and about folding powers rather than
+> amplitudes so opposite-sign Doppler cannot cancel.
+>
+> Their measurements agree with ours where they overlap. They report a phase re-draw moving
+> the old centroid by up to **15.6 Hz** and the new one by ~1e-11 Hz (we measured 17.5 Hz vs
+> 0.000 Hz on synthetic data). They independently state that no centroid reaches the 100 Hz
+> boundary on the released dataset — "max 85-96 Hz, so the cutoff comes from the
+> 10%-of-frames fallback either way" — which is the same finding as ours (69.6-72.9 Hz on the
+> retracted export, cutoff pinned to the fallback), now confirmed on the corrected data where
+> the fallback is 24 of 240 frames.
+>
+> PR #6 (`ae169ea`) then answered the other half of issue #2: the frame rate is read from the
+> file's own `/config` instead of being passed out of band, and the fixed 100 Hz tissue
+> boundary gains a `--tissue-velocity` equivalent in mm/s (100 Hz ≈ 40 mm/s against a Nyquist
+> velocity of 44.5 mm/s on this data).
+>
+> **What is left of this draft:** only the chunked complex128 Gram, and it is a much smaller
+> point than drafted below. The 24 GB figure was computed on the retracted export's
+> dimensions (700 frames × 2.13M voxels). On the corrected sample the full-copy cost is
+> **~4.1 GB against a 2.0 GB complex64 original** — still avoidable, no longer alarming.
+> The rest of this file is kept as the record of what we measured, not as something to send.
+
 **Status: draft for Rome. Nothing has been pushed to `alephneuro/microbubbles`.**
 Branch material lives in the scratchpad clone; the patch is reproduced at the bottom of
 this file so it survives the scratchpad. Evidence: `docs/determinism-issue2.md`.
