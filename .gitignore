@@ -26,3 +26,6 @@ state.json
 
 # diff-viewer regenerable data (regen: export_diff_viewer.py)
 scripts/wf_render_signal/diff_viewer/data/
+
+# comparison-viewer bundle (regen: scripts/export_compare_viewer.py)
+renders/compare_viewer/
