@@ -24,6 +24,7 @@ Design notes:
 """
 
 import os
+import re
 import subprocess
 import time
 
@@ -120,8 +121,12 @@ def recreate_full(n_acqs: int = 216, batch: int = 12, tgc_acqs: int = 12,
         vol.commit()
 
     # ---- roll up every batch present on disk, including earlier invocations ----
+    # `track` writes BOTH tracks_XXXX.pkl and tracks_XXXX_smoothed.pkl; matching on the
+    # "tracks_" prefix alone counts every batch twice (it reported 2,902 tracks >=35 on the
+    # first full run, exactly 2x the true 1,451).
     all_batches = []
-    for path in sorted(f for f in os.listdir(root) if f.startswith("tracks_")):
+    for path in sorted(f for f in os.listdir(root)
+                       if re.fullmatch(r"tracks_\d{4}\.pkl", f)):
         with open(f"{root}/{path}", "rb") as fh:
             got = pickle.load(fh)
         lens = np.array([len(t["positions"]) for t in got.get("tracks", [])] or [0])
