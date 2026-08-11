@@ -98,14 +98,35 @@ Recovery at matched density 34 detections/frame, 6 realizations × 300 bubbles
 Standard error on every difference is ±0.003 (and that is the *conservative*
 independent-arms figure; the arms share the same injected bubbles).
 
-**Which operating point wins, and by how much.** `rank24 + spatial_tgc`:
-**+0.030 absolute recovery, 0.366 → 0.396, an 8.2 % relative gain, ±0.003.** The
-honest framing is that this is a **normalization win, not an SVD-rank win**. The
-rank axis is nearly flat — knee (21 modes) versus rank24 (24 modes) differs by
-+0.003 ± 0.003, i.e. nothing. The normalization axis carries the whole effect,
-and the current rank is fine.
+**Which operating point wins, and by how much.** `rank24 + spatial_tgc`, on both
+acquisitions:
 
-Three arms actively hurt and should not be used:
+| | acq 0 | acq 1 (replication) |
+|---|---|---|
+| status quo `rank24 \| per_elev` | 0.366 | 0.551 |
+| winner `rank24 \| spatial_tgc` | **0.396 (+0.030)** | **0.564 (+0.013)** |
+| relative gain | +8.2 % | +2.4 % |
+| depth non-uniformity | 0.903 → **0.633** | 0.621 → **0.452** |
+
+The direction replicates and both margins clear the ±0.003 standard error
+comfortably, but **the magnitude varies by 2.3x between two acquisitions of the
+same animal**, so "+0.03" is not a number to carry forward. The defensible claim
+is *a small, consistent, single-digit-percent gain, larger where the baseline is
+weaker* — which is what a depth-and-lateral gain correction should do.
+
+The honest framing is that this is a **normalization win, not an SVD-rank win**.
+The rank axis is flat: on acq 0 the knee resolves to 21 against rank24's 24 and
+buys +0.003 ± 0.003, i.e. nothing; on acq 1 the knee resolves to **24 exactly**,
+so the two arms are literally the same filter. The bead's premise was that rank
+24 is an accidental, never-fired fallback — it is, and it is also *fine*. Leave
+it alone.
+
+**One arm does not replicate and should not be adopted.** `per_elev_zband`, the
+minimal fix of one denominator per (elevation, depth band), gave +0.018 on acq 0
+and **−0.014 on acq 1**. It changes sign. Had acq 0 been run alone it would have
+looked like a modest win; it is not one.
+
+Two arms actively hurt and should not be used:
 
 - **The MP high cutoff is a trap.** At this aspect ratio (γ = 240/1.06M) the
   Marchenko–Pastur bulk collapses to a point, so its upper edge sits above nearly
@@ -140,10 +161,11 @@ concern, confirmed and localized. Relative depth non-uniformity (spread ÷ mean,
 per SNR, averaged) falls from 0.903 to 0.633.
 
 Worth noting what did *not* work: `per_elev_zband` — the minimal fix, one
-denominator per (elevation, depth band) — recovers only +0.018 of the +0.030,
-and barely moves non-uniformity (0.860 vs 0.903). The residual is lateral, not
-axial: the beam profile varies across x as well as z, and only the full spatial
-map catches it.
+denominator per (elevation, depth band) — recovers only +0.018 of the +0.030 on
+acq 0, barely moves non-uniformity there (0.860 vs 0.903), and **reverses to
+−0.014 on acq 1**. The residual is lateral, not axial: the beam profile varies
+across x as well as z, and a purely depth-indexed denominator cannot see that.
+Only the full spatial map helps, and only it replicates.
 
 Pooling over SNR understates how bad this gets. At a fixed 12 dB — right in the
 detector's transition region, where a depth-dependent denominator does the most
@@ -222,8 +244,12 @@ It is built to be reused, and the reuse is the point:
 
 ## Honest limits
 
-- One acquisition drives the main table; acq 1 was beamformed and swept as a
-  replication (`j3_sweep_acq1.json`).
+- Two acquisitions, one animal, one session. Every *qualitative* finding
+  replicates on acq 1 — spatial_tgc wins and flattens depth, MP and the B18
+  spatial-correlation cutoff are catastrophic, the axial null and the slow
+  in-plane hole both reappear — but the winner's margin moves 2.3x, and
+  `per_elev_zband` changes sign. Two acquisitions is enough to reject an arm,
+  not to quote a coefficient.
 - Recovery is per *bubble-frame*, not per track. A tracker-level score needs the
   linking stage, and `block_shuffle` is the right null for that.
 - Injected bubbles are straight constant-velocity tracks at constant amplitude.
