@@ -482,8 +482,26 @@ def recovery_table(
         if key not in truth:
             continue
         out[f"by_{key}"] = stratify(truth[key], hit)
+    if "speed_mms" in truth and "direction" in truth:
+        # The compounding null is AXIAL ONLY, so the speed marginal averages a
+        # bubble moving into the null with one moving across it and buries a
+        # ~15 dB hole. This cross-tab is the only place it is visible, and it is
+        # the sharpest parameter-free prediction the instrument can check: the
+        # axial row should dip at 88.97 mm/s and the lateral row should not.
+        cross: dict[str, dict[str, dict[str, float]]] = {}
+        for d in np.unique(truth["direction"]):
+            m = truth["direction"] == d
+            cross[str(d)] = stratify(truth["speed_mms"][m], hit[m])
+        out["by_speed_x_direction"] = cross
     if "z_band" in truth and "snr_db" in truth:
         out.update(_depth_uniformity(truth, hit))
+        # Recovery vs depth at fixed SNR, which is the depth-non-uniformity claim
+        # in its raw form rather than reduced to one number.
+        prof: dict[str, dict[str, dict[str, float]]] = {}
+        for s in np.unique(truth["snr_db"]):
+            m = truth["snr_db"] == s
+            prof[f"{float(s):g}"] = stratify(truth["z_band"][m], hit[m])
+        out["depth_profile_by_snr"] = prof
     return out
 
 

@@ -616,16 +616,18 @@ def inject_bubbles(
 # --------------------------------------------------------------------------- #
 NULL_DESCRIPTIONS: dict[str, str] = {
     "block_shuffle": (
-        "Contiguous blocks of frames permuted. PRESERVES: every frame's spatial "
-        "content exactly (so speckle, PSF, depth-dependent gain and the amplitude "
-        "distribution are untouched) and, within a block, the short-timescale "
-        "temporal coherence the SVD needs to concentrate tissue in a few leading "
-        "modes. BREAKS: trajectories longer than the block, and the long-timescale "
-        "tissue modes across block boundaries. The block size is the dial: block=1 "
-        "(full shuffle) destroys the clutter structure entirely and leaves tissue "
-        "residue the SVD cannot remove, so it is a HARD null that OVER-states false "
-        "alarms; large blocks are gentler but leave real short bubble tracks intact, "
-        "understating them. Sweep it rather than trusting one value."
+        "Contiguous blocks of frames permuted. **MEASURED VERDICT: not a usable "
+        "null for a per-frame detector -- do not report it as one.** Permuting "
+        "frames leaves every frame's contents, including every real bubble, "
+        "exactly intact; it removes trajectories, not echoes. A detector that "
+        "works one frame at a time therefore sees the same material, and in the "
+        "J3 sweep both block=1 and block=20 returned the matched target density "
+        "(34.00/frame) for all 18 operating points -- i.e. zero information. Its "
+        "only real effect is on the SVD, which loses the temporal coherence it "
+        "uses to identify tissue; that shifts WHICH modes are removed but not how "
+        "much signal is present. Keep it as the null for TRACKER-level claims, "
+        "where destroying trajectories is exactly the right intervention, and use "
+        "phase_surrogate or quiet_crop for detector-level false alarms."
     ),
     "phase_surrogate": (
         "Per-voxel temporal Fourier surrogate: each voxel's time series keeps its "

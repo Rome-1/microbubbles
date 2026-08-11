@@ -46,7 +46,43 @@ gpu_image = (
     .add_local_dir(REPO, remote_path="/workspace/ultratrace_ulm")
 )
 
+# Beamforming needs the MACH kernel and the upstream package; the sweep does not,
+# so it is a separate, heavier image used only to mint a replication acquisition.
+POSTFIX_SHA = "193900631ad7eabdce1e39b7f3ecae7d7d1c88ad"
+bf_image = (
+    modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.11")
+    .apt_install("git")
+    .pip_install("h5py==3.11.0", "numpy<2.0", "scipy==1.13.1", "tqdm==4.66.4",
+                 "torch==2.4.1", "cupy-cuda12x==13.3.0", "mach-beamform")
+    .pip_install(
+        f"ultratrace-ulm-pipeline @ git+https://github.com/alephneuro/microbubbles.git@{POSTFIX_SHA}",
+        extra_options="--no-deps",
+    )
+)
+
 app = modal.App(f"{PROJECT}-j3-instrument")
+
+
+@app.function(image=bf_image, gpu="A100-80GB", timeout=3600, memory=262144, cpu=16.0,
+              volumes={"/root/data": vol})
+def beamform_acq(acq_start: int = 1, out: str = "j3_bf_acq1.h5") -> dict:
+    """Mint one more beamformed acquisition, for replicating the sweep's verdict.
+
+    Same settings as the 216-acquisition corrected run (``--spatial-tgc``, 25
+    elevation planes, coarseness 0.5), so the replication acquisition is
+    processed identically to the one already on the volume rather than being a
+    second, subtly different experiment.
+    """
+    import subprocess
+
+    h5 = f"{DATA_ROOT}/sanitized_neutral_ultratrace_216.h5"
+    dst = f"{DATA_ROOT}/{out}"
+    cmd = ["ultratrace-ulm", "beamform", "--input", h5, "--output", dst,
+           "--acq-start", str(acq_start), "--num-acqs", "1", "--spatial-tgc"]
+    print(" ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
+    vol.commit()
+    return {"out": out, "acq_start": acq_start}
 
 # The 18 operating points. Filter arms are outer because they share a Gram.
 FILTER_SPECS = [

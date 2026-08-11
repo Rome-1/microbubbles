@@ -28,6 +28,18 @@ def _fmt(x, n=3):
     return "nan" if f != f else f"{f:.{n}f}"
 
 
+def _gain_db(v_mms: float, lam: float = 0.8, fr: float = 222.43, n: int = 4) -> str:
+    """Analytic N-angle compounding gain for AXIAL motion, in dB (see inject.py)."""
+    import math
+
+    dphi = 4 * math.pi * v_mms / (lam * n * fr)
+    den = n * math.sin(dphi / 2)
+    if abs(den) < 1e-12:
+        return "0.0"
+    g = abs(math.sin(n * dphi / 2) / den)
+    return "-inf" if g < 1e-6 else f"{20 * math.log10(g):.1f}"
+
+
 def main(path: str, density: str | None = None) -> None:
     rep = json.load(open(path))
     res = rep["results"]
@@ -83,9 +95,31 @@ def main(path: str, density: str | None = None) -> None:
                 f"{k}={_fmt(v['recovery'], 3)}(n={v['n']})" for k, v in sorted(
                     r[axis].items(),
                     key=lambda kv: (float(kv[0]) if kv[0].replace(".", "").isdigit() else 0))))
-        print(f"\ndepth non-uniformity by SNR: " + "  ".join(
+        print(f"\ndepth non-uniformity (spread/mean) by SNR: " + "  ".join(
             f"{k}dB={_fmt(v)}" for k, v in sorted(
                 r.get("depth_nonuniformity_by_snr", {}).items(), key=lambda kv: float(kv[0]))))
+
+        cross = r.get("by_speed_x_direction")
+        if cross:
+            speeds = sorted({float(k) for v in cross.values() for k in v})
+            print("\nrecovery by speed x direction (the compounding null is AXIAL only):\n")
+            print("| direction | " + " | ".join(f"{s:g}" for s in speeds) + " |")
+            print("|---" * (len(speeds) + 1) + "|")
+            for d in sorted(cross):
+                print(f"| {d} | " + " | ".join(
+                    _fmt(cross[d].get(f"{s:g}", {}).get("recovery")) for s in speeds) + " |")
+            print("| *predicted 4-angle gain (dB)* | " + " | ".join(
+                _gain_db(s) for s in speeds) + " |")
+
+        prof = r.get("depth_profile_by_snr", {})
+        if prof:
+            bands = sorted({int(b) for v in prof.values() for b in v})
+            print("\nrecovery by depth band at fixed SNR:\n")
+            print("| SNR (dB) | " + " | ".join(f"band {b}" for b in bands) + " |")
+            print("|---" * (len(bands) + 1) + "|")
+            for snr in sorted(prof, key=float):
+                print(f"| {snr} | " + " | ".join(
+                    _fmt(prof[snr].get(str(b), {}).get("recovery")) for b in bands) + " |")
 
     print("\n## False-alarm cross-check on null data\n")
     nulls = sorted({n for s in res.values() for n in s.get("false_alarms", {}).get(density, {})})
