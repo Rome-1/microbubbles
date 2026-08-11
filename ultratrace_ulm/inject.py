@@ -392,10 +392,14 @@ class Bubble:
     speed_mms: float
     axial_frac: float  # |v_z| / |v|, 1 = pure axial (feels the null), 0 = in-plane
     z_band: int
+    direction: str = "axial"
 
 
 DEFAULT_SPEEDS_MMS: tuple[float, ...] = (5.0, 20.0, 45.0, 70.0, 88.97, 110.0, 130.0)
-DEFAULT_SNR_DB: tuple[float, ...] = (0.0, 3.0, 6.0, 9.0, 12.0, 15.0)
+# The interesting range, measured: below ~6 dB nothing is recovered by any arm
+# and above ~21 dB everything is, so a sweep centred lower wastes its samples on
+# two flat ends. Peak-voxel amplitude over the depth-resolved reference sigma.
+DEFAULT_SNR_DB: tuple[float, ...] = (6.0, 9.0, 12.0, 15.0, 18.0, 21.0)
 
 
 def make_bubble_plan(
@@ -435,13 +439,29 @@ def make_bubble_plan(
     snrs = list(snr_db)
     dirs = list(directions)
 
+    # Draw cells from a SHUFFLED full factorial rather than by nested integer
+    # division. The nested-division form silently degenerates whenever
+    # `n_bubbles` is smaller than the product of the inner factors' sizes -- the
+    # outermost factor then never advances off its first level, and one whole
+    # axis of the design collapses to a constant without any error. (It did:
+    # the first run of this sweep planted 900 bubbles that were all axial, which
+    # confounded the speed stratification with the axial-only compounding null.)
+    # A shuffled factorial cannot degenerate that way, and successive seeds
+    # cover different cells so realizations accumulate rather than repeat.
+    cells = [
+        (si, ni, bi, di)
+        for si in range(len(speeds))
+        for ni in range(len(snrs))
+        for bi in range(int(n_z_bands))
+        for di in range(len(dirs))
+    ]
+    rng.shuffle(cells)
+
     band_edges = np.linspace(mz, n_z - mz, int(n_z_bands) + 1)
     bubbles: list[Bubble] = []
     for i in range(int(n_bubbles)):
-        speed = speeds[i % len(speeds)]
-        snr = snrs[(i // len(speeds)) % len(snrs)]
-        band = (i // (len(speeds) * len(snrs))) % int(n_z_bands)
-        direction = dirs[(i // (len(speeds) * len(snrs) * int(n_z_bands))) % len(dirs)]
+        si, ni, band, di = cells[i % len(cells)]
+        speed, snr, direction = speeds[si], snrs[ni], dirs[di]
 
         if direction == "axial":
             u = np.array([0.0, 1.0, 0.0])
@@ -494,6 +514,7 @@ def make_bubble_plan(
                 speed_mms=float(speed),
                 axial_frac=float(abs(u[1])),
                 z_band=int(band),
+                direction=str(direction),
             )
         )
     return bubbles
@@ -536,7 +557,7 @@ def inject_bubbles(
         k: []
         for k in (
             "bubble_id", "frame", "e", "z", "x", "e_mm", "z_mm", "x_mm",
-            "snr_db", "speed_mms", "axial_frac", "z_band", "gain_db", "amp",
+            "snr_db", "speed_mms", "axial_frac", "z_band", "gain_db", "amp", "direction",
         )
     }
     for b in bubbles:
@@ -572,6 +593,7 @@ def inject_bubbles(
             rows["snr_db"].append(b.snr_db)
             rows["speed_mms"].append(b.speed_mms)
             rows["axial_frac"].append(b.axial_frac)
+            rows["direction"].append(b.direction)
             # Depth band is read from THIS frame's position, not the track's
             # start: a fast axial bubble crosses bands within its own lifetime,
             # and the question being asked ("is recovery depth-uniform?") is

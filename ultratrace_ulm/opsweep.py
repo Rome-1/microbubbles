@@ -43,6 +43,8 @@ import numpy as np
 
 __all__ = [
     "NORM_MODES",
+    "LOW_METHODS",
+    "svd_filter_bank",
     "zscore_field",
     "find_peaks",
     "threshold_for_count",
@@ -61,6 +63,140 @@ def _ndimage(xp: Any):
         return nd
     import scipy.ndimage as nd
     return nd
+
+
+# --------------------------------------------------------------------------- #
+# The clutter-filter arm: one Gram, several cutoffs
+# --------------------------------------------------------------------------- #
+LOW_METHODS: tuple[str, ...] = ("rank24", "knee", "knee_spatial")
+
+
+def svd_filter_bank(
+    volume: Any,
+    specs: Sequence[tuple[str, str, bool]],
+    *,
+    xp: Any = np,
+    voxel_chunk: int = 300_000,
+    min_rank: int = 1,
+    ceiling_frac: float = 0.1,
+    rel_threshold: float = 0.5,
+    n_eval: int | None = None,
+    mode_chunk: int = 16,
+    to_host: bool = True,
+):
+    """Yield ``(name, cutoffs, magnitude)`` for each clutter-filter arm.
+
+    ``specs`` is a list of ``(name, low_method, mp_high)`` where ``low_method``
+    is one of :data:`LOW_METHODS` and ``mp_high`` toggles the Marchenko-Pastur
+    high-order noise cutoff.
+
+    The Gram is eigendecomposed **once** and shared by every arm. That is not
+    only an economy: it means the arms differ by exactly the cutoff indices and
+    nothing else -- no re-accumulation drift, no chance that two arms saw
+    numerically different bases. Accumulation is in complex128 for the same
+    reason ``gpu_svd`` does it: removing the top-k of n leaves a residual that is
+    ill-conditioned near the eigenvalue boundary, and float32 accumulation over
+    ~1 M voxels visibly changes which modes are kept.
+
+    The three low-cutoff arms:
+
+    ``rank24``
+        The status quo. ``spectral_centroid_cutoff`` is documented as adaptive
+        but on 222 Hz data no temporal mode's spectral centroid reaches the
+        100 Hz test (max 85-96 Hz), so it returns its fallback,
+        ``round(0.1 * 240) = 24``, every single time. It is a constant, and an
+        unfired one -- which is exactly why it deserves to be on trial rather
+        than assumed.
+    ``knee``
+        ``svd_knee.singular_value_knee``, with 24 recast as a ceiling instead of
+        a floor, so this arm can only ever remove fewer modes.
+    ``knee_spatial``
+        The Lok/Song 2020 rule ``min(knee, spatial-correlation-collapse)``.
+        Strictly more conservative again.
+
+    A standing caveat: all of this machinery was empirically validated on the
+    **withdrawn** dataset, so that validation is void. It is treated here as
+    untested code on trial, not as a known-good default -- which is the point of
+    running it against injected ground truth instead of against a render.
+
+    Yields magnitudes as host float32 arrays one at a time rather than returning
+    a dict, because six filtered copies of a 2 GB volume do not co-exist.
+    """
+    from .svd_knee import (
+        _collapse_index,
+        _neighbor_coherence,
+        mp_noise_cutoff,
+        singular_value_knee,
+    )
+
+    data = np.asarray(volume)
+    if data.ndim != 4:
+        raise ValueError(f"Expected volume (frames,elev,z,x), got {data.shape}")
+    n_f = int(data.shape[0])
+    spatial_shape = tuple(int(v) for v in data.shape[1:])
+    mat = xp.asarray(data, dtype=xp.complex64).reshape(n_f, -1)
+    n_vox = int(mat.shape[1])
+    to_np = (lambda a: xp.asnumpy(a)) if xp.__name__ == "cupy" else (lambda a: np.asarray(a))
+
+    gram = xp.zeros((n_f, n_f), dtype=xp.complex128)
+    for s0 in range(0, n_vox, voxel_chunk):
+        mc = mat[:, s0 : s0 + voxel_chunk]
+        gram += (mc @ mc.conj().T).astype(xp.complex128)
+    evals, u = xp.linalg.eigh(gram)
+    order = xp.argsort(evals)[::-1]
+    u = u[:, order]
+    ev = np.maximum(to_np(evals)[::-1].real, 0.0)  # descending
+    svals = np.sqrt(ev)
+    ceiling = max(1, int(round(float(ceiling_frac) * n_f)))
+
+    lows: dict[str, int] = {}
+    lows["rank24"] = ceiling  # the fallback value, reproduced exactly
+    lows["knee"] = singular_value_knee(svals, min_rank=min_rank, max_rank=ceiling)
+    if any(s[1] == "knee_spatial" for s in specs):
+        n_ev = int(min(n_eval or max(3 * (ceiling + 1), 24), n_f))
+        coh = np.empty(n_ev, dtype=np.float64)
+        for b0 in range(0, n_ev, mode_chunk):
+            b1 = min(b0 + mode_chunk, n_ev)
+            rows = to_np(u[:, b0:b1].astype(xp.complex64).conj().T @ mat)
+            block = _neighbor_coherence(rows, spatial_shape)
+            if block is None:
+                coh = None
+                break
+            coh[b0:b1] = block
+        spatial_cut = (
+            ceiling if coh is None
+            else _collapse_index(coh, min_rank, ceiling, float(rel_threshold))
+        )
+        lows["knee_spatial"] = int(min(lows["knee"], spatial_cut))
+    mp_high_remove = mp_noise_cutoff(ev, n_f, n_vox)
+
+    for name, low_method, mp_high in specs:
+        if low_method not in lows:
+            raise ValueError(f"unknown low-cutoff method {low_method!r}; expected {LOW_METHODS}")
+        low = int(lows[low_method])
+        high_remove = int(mp_high_remove) if mp_high else 0
+        if low + high_remove >= n_f:
+            high_remove = max(0, n_f - low - 1)
+        uc = u[:, low : n_f - high_remove].astype(xp.complex64)
+        uc_h = uc.conj().T
+        # Keep the result on the device when the caller will immediately z-score
+        # and peak-find there: a 1 GB round trip per arm per volume dominates the
+        # arithmetic otherwise.
+        sink = np if to_host else xp
+        mag = sink.empty((n_f, *spatial_shape), dtype=sink.float32)
+        flat = mag.reshape(n_f, -1)
+        for s0 in range(0, n_vox, voxel_chunk):
+            mc = mat[:, s0 : s0 + voxel_chunk]
+            block = xp.abs(uc @ (uc_h @ mc))
+            flat[:, s0 : s0 + voxel_chunk] = to_np(block) if to_host else block
+        cutoffs = {
+            "low": low, "high_remove": high_remove, "kept": n_f - low - high_remove,
+            "low_method": low_method, "mp_high": bool(mp_high), "ceiling": ceiling,
+        }
+        del uc, uc_h
+        if xp.__name__ == "cupy":
+            xp.get_default_memory_pool().free_all_blocks()
+        yield name, cutoffs, mag
 
 
 # --------------------------------------------------------------------------- #
@@ -127,44 +263,48 @@ def zscore_field(
     else:
         mode_for_stats = mode
 
-    if mode_for_stats == "per_elev":
-        means = xp.zeros((n_e,), dtype=xp.float32)
-        stds = xp.ones((n_e,), dtype=xp.float32)
-        for e in range(n_e):
-            v = data[:, e]
-            m = v > 0
-            if bool(xp.any(m)):
-                sel = v[m]
-                means[e] = sel.mean()
-                s = sel.std()
-                stds[e] = s if float(s) > 1e-10 else 1.0
-        return ((data - means[None, :, None, None]) / (stds[None, :, None, None] + 1e-10)).astype(
-            xp.float32
-        )
-
-    if mode_for_stats != "per_elev_zband":
+    if mode_for_stats not in ("per_elev", "per_elev_zband"):
         raise ValueError(f"unknown normalization mode {mode!r}; expected one of {NORM_MODES}")
 
-    nb = int(n_z_bands)
-    edges = np.linspace(0, n_z, nb + 1).astype(int)
-    centers = 0.5 * (edges[:-1] + edges[1:] - 1)
-    bm = np.zeros((n_e, nb), dtype=np.float32)
-    bs = np.ones((n_e, nb), dtype=np.float32)
-    for e in range(n_e):
-        for b in range(nb):
-            v = data[:, e, edges[b] : edges[b + 1], :]
-            m = v > 0
-            if bool(xp.any(m)):
-                sel = v[m]
-                bm[e, b] = float(sel.mean())
-                s = float(sel.std())
-                bs[e, b] = s if s > 1e-10 else 1.0
-    zi = np.arange(n_z, dtype=np.float64)
-    mean_z = np.stack([np.interp(zi, centers, bm[e]) for e in range(n_e)], axis=0)
-    std_z = np.stack([np.interp(zi, centers, bs[e]) for e in range(n_e)], axis=0)
-    mean_z = xp.asarray(mean_z, dtype=xp.float32)[None, :, :, None]
-    std_z = xp.asarray(std_z, dtype=xp.float32)[None, :, :, None]
-    return ((data - mean_z) / (std_z + 1e-10)).astype(xp.float32)
+    # Both arms need the same positive-voxel moments, just pooled over different
+    # z-extents, so accumulate them once per z-slice and aggregate afterwards.
+    # Doing it this way rather than masking per band matters on GPU: it is three
+    # reductions instead of 2 * n_elev * n_bands device syncs.
+    pos = data > 0
+    dp = xp.where(pos, data, xp.float32(0.0))
+    cnt = pos.sum(axis=(0, 3)).astype(xp.float64)          # (elev, z)
+    s1 = dp.sum(axis=(0, 3)).astype(xp.float64)
+    s2 = (dp * dp).sum(axis=(0, 3)).astype(xp.float64)
+    del pos, dp
+    to_np = (lambda a: xp.asnumpy(a)) if xp.__name__ == "cupy" else (lambda a: np.asarray(a))
+    cnt, s1, s2 = to_np(cnt), to_np(s1), to_np(s2)
+
+    def moments(c, a, b):
+        c = np.maximum(c, 1.0)
+        m = a / c
+        v = np.maximum(b / c - m * m, 0.0)
+        s = np.sqrt(v)
+        return m.astype(np.float32), np.where(s > 1e-10, s, 1.0).astype(np.float32)
+
+    if mode_for_stats == "per_elev":
+        mean_e, std_e = moments(cnt.sum(1), s1.sum(1), s2.sum(1))
+        mean_z = np.repeat(mean_e[:, None], n_z, axis=1)
+        std_z = np.repeat(std_e[:, None], n_z, axis=1)
+    else:
+        nb = int(n_z_bands)
+        edges = np.linspace(0, n_z, nb + 1).astype(int)
+        centers = 0.5 * (edges[:-1] + edges[1:] - 1)
+        agg = lambda arr: np.stack([arr[:, edges[b]:edges[b + 1]].sum(1) for b in range(nb)], 1)
+        bm, bs = moments(agg(cnt), agg(s1), agg(s2))
+        # Interpolate between band centres rather than stepping: a discontinuity
+        # at a band edge is itself a local maximum generator.
+        zi = np.arange(n_z, dtype=np.float64)
+        mean_z = np.stack([np.interp(zi, centers, bm[e]) for e in range(n_e)], axis=0)
+        std_z = np.stack([np.interp(zi, centers, bs[e]) for e in range(n_e)], axis=0)
+
+    mz = xp.asarray(mean_z, dtype=xp.float32)[None, :, :, None]
+    sz = xp.asarray(std_z, dtype=xp.float32)[None, :, :, None]
+    return ((data - mz) / (sz + 1e-10)).astype(xp.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -338,28 +478,67 @@ def recovery_table(
         "n_truth": int(hit.size),
         "recovery": float(hit.mean()) if hit.size else 0.0,
     }
-    for key in ("speed_mms", "snr_db", "z_band", "axial_frac"):
+    for key in ("speed_mms", "snr_db", "z_band", "axial_frac", "direction"):
         if key not in truth:
             continue
         out[f"by_{key}"] = stratify(truth[key], hit)
     if "z_band" in truth and "snr_db" in truth:
-        per_snr = {}
-        for s in np.unique(truth["snr_db"]):
-            m = truth["snr_db"] == s
-            byband = stratify(truth["z_band"][m], hit[m])
-            vals = [v["recovery"] for v in byband.values() if v["n"] >= 20]
-            per_snr[f"{float(s):g}"] = (max(vals) - min(vals)) if len(vals) >= 2 else float("nan")
-        out["depth_nonuniformity_by_snr"] = per_snr
-        finite = [v for v in per_snr.values() if np.isfinite(v)]
-        out["depth_nonuniformity"] = float(np.mean(finite)) if finite else float("nan")
+        out.update(_depth_uniformity(truth, hit))
     return out
+
+
+def _depth_uniformity(
+    truth: dict[str, np.ndarray],
+    hit: np.ndarray,
+    *,
+    min_n: int = 300,
+    min_mean_recovery: float = 0.05,
+) -> dict[str, Any]:
+    """Depth spread of recovery, measured so that arms can be compared.
+
+    Three deliberate choices, each of which changed the answer when tested:
+
+    * **Relative, not absolute.** The raw ``max - min`` across depth bands grows
+      simply because an arm recovers more overall, so ranking arms by it rewards
+      the arm that finds nothing. The reported figure is the spread divided by
+      the mean recovery across bands.
+    * **Per SNR, not pooled.** Recovery is steeply SNR-dependent, so pooling
+      would report the SNR mix rather than a depth effect. Only SNRs whose mean
+      recovery clears ``min_mean_recovery`` count -- the spread of a near-zero
+      rate is noise, not non-uniformity.
+    * **Bands need ``min_n`` samples.** The extreme depth bands are half-covered
+      (the injection margin keeps tracks off the faces), so an unguarded max-min
+      is decided by whichever edge band happened to get a handful of bubbles.
+    """
+    per_snr_rel: dict[str, float] = {}
+    per_snr_abs: dict[str, float] = {}
+    for s in np.unique(truth["snr_db"]):
+        m = truth["snr_db"] == s
+        byband = stratify(truth["z_band"][m], hit[m])
+        vals = [v["recovery"] for v in byband.values() if v["n"] >= int(min_n)]
+        key = f"{float(s):g}"
+        if len(vals) < 2 or float(np.mean(vals)) < float(min_mean_recovery):
+            per_snr_rel[key] = per_snr_abs[key] = float("nan")
+            continue
+        spread = float(max(vals) - min(vals))
+        per_snr_abs[key] = spread
+        per_snr_rel[key] = spread / float(np.mean(vals))
+    finite = [v for v in per_snr_rel.values() if np.isfinite(v)]
+    return {
+        "depth_nonuniformity_by_snr": per_snr_rel,
+        "depth_nonuniformity_abs_by_snr": per_snr_abs,
+        "depth_nonuniformity": float(np.mean(finite)) if finite else float("nan"),
+        "depth_nonuniformity_n_snr_scored": len(finite),
+    }
 
 
 def stratify(values: np.ndarray, hit: np.ndarray) -> dict[str, dict[str, float]]:
     """Recovery rate per unique level of ``values``, with a Wilson 95% interval."""
     out: dict[str, dict[str, float]] = {}
+    numeric = values.dtype.kind in "iuf"
     for v in np.unique(values):
         m = values == v
+        label = f"{float(v):g}" if numeric else str(v)
         n = int(np.count_nonzero(m))
         k = int(np.count_nonzero(hit[m]))
         p = k / n if n else 0.0
@@ -371,5 +550,5 @@ def stratify(values: np.ndarray, hit: np.ndarray) -> dict[str, dict[str, float]]
             lo, hi = max(0.0, ctr - half), min(1.0, ctr + half)
         else:
             lo = hi = 0.0
-        out[f"{float(v):g}"] = {"n": n, "k": k, "recovery": p, "lo95": lo, "hi95": hi}
+        out[label] = {"n": n, "k": k, "recovery": p, "lo95": lo, "hi95": hi}
     return out

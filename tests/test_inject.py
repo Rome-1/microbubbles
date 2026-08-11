@@ -368,3 +368,54 @@ def test_match_peaks_to_truth_recovers_a_loud_injection():
     p0 = find_peaks(z0, min_distance=2, floor=-10.0)
     chance = match_peaks_to_truth(truth, p0.at(threshold_for_count(p0, peaks.zscore.size)))
     assert chance.mean() < 0.4 and hit.mean() > 2.5 * chance.mean(), (hit.mean(), chance.mean())
+
+
+# --------------------------------------------------------------------------- #
+# The clutter-filter arm
+# --------------------------------------------------------------------------- #
+def test_filter_bank_shares_one_basis_and_orders_the_cutoffs():
+    """The three low-cutoff arms are nested: knee_spatial <= knee <= rank24."""
+    from ultratrace_ulm.opsweep import svd_filter_bank
+
+    rng = np.random.default_rng(0)
+    n_f = 60
+    # 3 strong slow "tissue" modes + weak fast "blood" + noise.
+    t = np.arange(n_f)
+    tissue = sum(
+        np.exp(2j * np.pi * f * t / n_f)[:, None] * (rng.normal(size=(1, 900)) * 60.0)
+        for f in (1, 2, 3)
+    )
+    blood = np.exp(2j * np.pi * 20 * t / n_f)[:, None] * (rng.normal(size=(1, 900)) * 2.0)
+    noise = rng.normal(size=(n_f, 900)) + 1j * rng.normal(size=(n_f, 900))
+    vol = (tissue + blood + noise).reshape(n_f, 1, 30, 30).astype(np.complex64)
+
+    specs = [(f"{m}{'_mp' if h else ''}", m, h)
+             for m in ("rank24", "knee", "knee_spatial") for h in (False, True)]
+    got = {name: (c, mag) for name, c, mag in svd_filter_bank(vol, specs, ceiling_frac=0.1)}
+    assert set(got) == {s[0] for s in specs}
+    c = {k: v[0] for k, v in got.items()}
+    assert c["rank24"]["low"] == round(0.1 * n_f)          # the unfired fallback, reproduced
+    assert c["knee"]["low"] <= c["rank24"]["low"]           # 24 is a CEILING for the knee
+    assert c["knee_spatial"]["low"] <= c["knee"]["low"]     # L20 min() rule
+    assert c["knee"]["low"] >= 1                            # the DC mode is always removed
+    # The MP switch only ever removes trailing modes, never leading ones.
+    for m in ("rank24", "knee", "knee_spatial"):
+        assert c[f"{m}_mp"]["low"] == c[m]["low"]
+        assert c[f"{m}_mp"]["high_remove"] >= c[m]["high_remove"] == 0
+    for _, mag in got.values():
+        assert mag.shape == vol.shape and mag.dtype == np.float32
+
+
+def test_filter_bank_keeping_more_modes_retains_more_energy():
+    from ultratrace_ulm.opsweep import svd_filter_bank
+
+    rng = np.random.default_rng(1)
+    n_f = 40
+    t = np.arange(n_f)
+    vol = (np.exp(2j * np.pi * t / n_f)[:, None] * (rng.normal(size=(1, 400)) * 40.0)
+           + rng.normal(size=(n_f, 400)) + 1j * rng.normal(size=(n_f, 400))
+           ).reshape(n_f, 1, 20, 20).astype(np.complex64)
+    out = {n: (c, m) for n, c, m in
+           svd_filter_bank(vol, [("a", "rank24", False), ("b", "knee", False)])}
+    assert out["b"][0]["low"] < out["a"][0]["low"]
+    assert float((out["b"][1] ** 2).sum()) > float((out["a"][1] ** 2).sum())
