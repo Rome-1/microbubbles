@@ -271,6 +271,7 @@ def beamform_iq(
     config: NeutralConfig,
     *,
     stream_accumulate: bool = False,
+    return_angles: bool = False,
 ) -> tuple[np.ndarray, Grid]:
     """Beamform neutral IQ with the mach experimental kernel.
 
@@ -377,6 +378,18 @@ def beamform_iq(
             tukey_alpha=0.5,
         )  # (n_points, n_frames)
         return bf.reshape(grid.depth_pixels, grid.height_pixels, grid.width_pixels, num_frames)
+
+    if return_angles:
+        # Per-angle volumes WITHOUT the coherent sum (mb-8t2 / J2). The sum below is a
+        # velocity-selective filter: a scatterer moving axially at v advances the round-trip
+        # phase by 4*pi*v/(lambda*PRF) between consecutive transmits, so the 4-phasor sum has
+        # gain |sin(2*dphi)/(4*sin(dphi/2))| -- a null at lambda*FR/2 = 88.97 mm/s on this
+        # data, and -1.7 to -7.5 dB across the measured speed range. Returning the stack lets
+        # a caller re-sum under conjugate phase hypotheses and keep the 4-angle sidelobe
+        # suppression that a single-angle path would throw away.
+        angles = np.stack([cp.asnumpy(_angle_bf(a)) for a in range(num_angles)], axis=0)
+        angles = np.transpose(angles, (0, 4, 2, 1, 3)).astype(np.complex64)  # (A, F, elev, z, x)
+        return angles, grid
 
     if stream_accumulate:
         # Sum angles into one host accumulator: peak host ~2x the volume, not Ax.
