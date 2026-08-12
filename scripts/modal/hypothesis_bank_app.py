@@ -150,6 +150,17 @@ def bank_v3(n_acqs: int = 2, acq_start: int = 0, sigma_threshold: float = 2.0,
                               "observed_ratio": round(float(np.median(ratio[m])), 4),
                               "predicted_ratio": round(float(pred), 4)})
 
+            # export per-detection coherence + coordinates so the curve can be re-binned
+            # against INDEPENDENTLY tracked step velocity. The in-run binning uses velocity
+            # implied from the inter-angle phase slope, which is derived from the same phasors
+            # as the ratio -- noise inflates both, so that curve cannot stand on its own.
+            np.savez_compressed(
+                f"{DATA_ROOT}/coherence_acq{aid}.npz",
+                frame=idx[0].astype(np.int32), elev=idx[1].astype(np.int32),
+                z=idx[2].astype(np.int32), x=idx[3].astype(np.int32),
+                ratio=ratio.astype(np.float32), zscore=zs.astype(np.float32),
+                v_implied=v_implied.astype(np.float32))
+
             rec = {"acq": str(aid), "n_detections": int(len(zs)),
                    "ratio_median_all": round(float(np.median(ratio)), 4),
                    "ratio_p10": round(float(np.percentile(ratio, 10)), 4),
