@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Reference vs. Recreation</title>
+    <title>Reference vs. Recreation vs. Improved</title>
     <style>
       * { margin: 0; padding: 0; box-sizing: border-box; }
       body { overflow: hidden; background: #000; font: 13px/1.5 ui-monospace, monospace; color: #fff; }
@@ -12,7 +12,7 @@
         position: absolute; top: 14px; left: 14px;
         background: rgba(4,4,10,0.72);
         border: 1px solid rgba(255,255,255,0.14);
-        border-radius: 6px; padding: 12px 14px; min-width: 268px;
+        border-radius: 6px; padding: 12px 14px; min-width: 292px;
         user-select: none;
       }
       #hud h1 { font-size: 15px; letter-spacing: 0.02em; margin-bottom: 10px; }
@@ -51,8 +51,10 @@
       <div id="legend"></div>
       <div id="modes"></div>
       <div id="hint">
-        <b>1</b> reference &nbsp; <b>2</b> recreation &nbsp; <b>3</b> both &nbsp; <b>4</b> reference as-released<br />
-        <b>space</b> / <b>tab</b> flip A/B &nbsp;&middot;&nbsp; <b>p</b> pause &nbsp;&middot;&nbsp; drag to orbit
+        <b>1</b> reference &nbsp; <b>2</b> recreation &nbsp; <b>3</b> improved &nbsp; <b>4</b> overlay<br />
+        <b>m</b> matched &ge;15 &nbsp; <b>n</b> native floors &nbsp; <b>h</b> only &ge;35<br />
+        <b>space</b> / <b>tab</b> cycle the three &nbsp;&middot;&nbsp; <b>p</b> pause &nbsp;&middot;&nbsp;
+        <b>r</b> restart sweep &nbsp;&middot;&nbsp; drag to orbit
       </div>
       <div id="err"></div>
     </div>
@@ -75,11 +77,13 @@ attribute float aSpeed;
 attribute float aIntensity;
 attribute float aRandom;
 attribute float aFrame;
+attribute float aLen;
 
 uniform float u_pointSize;
 uniform float u_pixelRatio;
 uniform float u_jitter;
 uniform float u_time;
+uniform float u_minLength;
 uniform float u_speedFilter;
 uniform float u_speedBand;
 uniform float u_reveal;
@@ -98,6 +102,15 @@ void main() {
   // Progressive accumulation: only show samples whose (normalised) time has been
   // reached by the reveal front. Past samples persist, so the super-resolution
   // vessel map visibly builds up over the cycle, then resets and replays.
+  // Length floor is applied here, not in the exporter: every dataset is packed
+  // once at its own native floor and every higher cutoff (matched >=15, the
+  // >=35 headline) is this one comparison, so the views can never drift apart.
+  if (aLen < u_minLength) {
+    gl_PointSize = 0.0;
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    return;
+  }
+
   if (aFrame > u_reveal) {
     gl_PointSize = 0.0;
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
@@ -249,22 +262,34 @@ async function loadTracks(url) {
   const tableOffset = 64;
   const tableView = new DataView(buffer, tableOffset, nTracks * 8);
   const tracks = new Array(nTracks);
-  let sumLen = 0;
-  let nGe35 = 0;
+  const lengths = new Int32Array(nTracks);
   for (let i = 0; i < nTracks; i++) {
     const length = tableView.getUint32(i * 8 + 4, true);
     tracks[i] = { pointOffset: tableView.getUint32(i * 8, true), length };
-    sumLen += length;
-    if (length >= 35) nGe35++;
+    lengths[i] = length;
   }
 
   const pointDataOffset = tableOffset + nTracks * 8;
   const pointData = new Float32Array(buffer, pointDataOffset, totalPoints * floatsPerPoint);
 
   return {
-    nTracks, totalPoints, maxSpeed, boundsMin, boundsMax, tracks, pointData, floatsPerPoint,
-    nGe35, meanLength: nTracks ? sumLen / nTracks : 0,
+    nTracks, totalPoints, maxSpeed, boundsMin, boundsMax, tracks, lengths,
+    pointData, floatsPerPoint,
   };
+}
+
+// Restat a dataset at an arbitrary length floor. The bins are packed at each
+// dataset's native floor and never re-exported, so every number the HUD shows
+// at every floor is derived from the same bytes that are on screen.
+function statsAtFloor(d, floor) {
+  let n = 0, sum = 0, ge35 = 0;
+  for (let i = 0; i < d.lengths.length; i++) {
+    const L = d.lengths[i];
+    if (L < floor) continue;
+    n++; sum += L;
+    if (L >= 35) ge35++;
+  }
+  return { n, ge35, points: sum, meanLength: n ? sum / n : 0 };
 }
 
 // ============================================================
@@ -298,6 +323,7 @@ class TrackSystem {
     const intensities = new Float32Array(totalPoints);
     const randoms = new Float32Array(totalPoints);
     const frames = new Float32Array(totalPoints);
+    const lens = new Float32Array(totalPoints);
 
     let k = 0;
     for (let i = 0; i < nTracks; i++) {
@@ -312,6 +338,7 @@ class TrackSystem {
         intensities[k] = hasIntensity ? pointData[b + 5] : 1.0;
         randoms[k] = Math.random();
         frames[k] = (pointData[b + 3] - minFrame) / span;
+        lens[k] = len;
         k++;
       }
     }
@@ -322,6 +349,7 @@ class TrackSystem {
     geometry.setAttribute("aIntensity", new THREE.BufferAttribute(intensities, 1));
     geometry.setAttribute("aRandom", new THREE.BufferAttribute(randoms, 1));
     geometry.setAttribute("aFrame", new THREE.BufferAttribute(frames, 1));
+    geometry.setAttribute("aLen", new THREE.BufferAttribute(lens, 1));
 
     this.uniforms = {
       u_pointSize: { value: 0.3 },
@@ -330,6 +358,7 @@ class TrackSystem {
       u_colormap: { value: 0 },
       u_jitter: { value: 0.0 },
       u_time: { value: 0.0 },
+      u_minLength: { value: 0.0 },
       u_speedFilter: { value: -1.0 },
       u_speedBand: { value: 0.08 },
       u_useIntensity: { value: 0 },
@@ -361,6 +390,10 @@ class TrackSystem {
     this.uniforms.u_reveal.value = Math.min(reveal, 1.0);
   }
 
+  setMinLength(floor) {
+    this.uniforms.u_minLength.value = floor;
+  }
+
   setRenderParams({ pointSize, maxSpeed, colormap, jitter, speedFilter, useIntensity, useSolid }) {
     if (pointSize !== undefined) this.uniforms.u_pointSize.value = pointSize;
     if (maxSpeed !== undefined) this.uniforms.u_maxSpeed.value = maxSpeed;
@@ -377,20 +410,35 @@ class TrackSystem {
 // Datasets
 // ============================================================
 
-const DATASETS = [
-  { key: "reference",  label: "REFERENCE (Aleph)",       file: "data/reference.bin",       color: 0x4fa8ff },
-  { key: "recreation", label: "RECREATION (ours)",       file: "data/recreation.bin",      color: 0xff8a3d },
-  { key: "reference5", label: "REFERENCE as released",   file: "data/reference_min5.bin",  color: 0x9d7bff },
+// Colours are identity-only; they matter in overlay mode, where the shared
+// speed colormap has to give way to "which run drew this point".
+const COLORS = {
+  reference:  0x4fa8ff,
+  recreation: 0xff8a3d,
+  improved:   0x46e08a,
+};
+const ORDER = ["reference", "recreation", "improved"];
+
+let META = null;
+let DATASETS = [];   // filled from data/meta.json
+
+// Three length floors over the SAME bins:
+//   matched  -- all three at >=15. The default, and the only like-for-like view.
+//   native   -- each run at the floor it actually published (5 / 15 / 8).
+//               NOT like-for-like: a run that emits shorter tracks looks denser.
+//   headline -- >=35 only. Above every native floor here, so it is the one
+//               count no floor choice can flatter.
+const FLOOR_MODES = [
+  { key: "matched",  hotkey: "m", label: "Matched >=15" },
+  { key: "native",   hotkey: "n", label: "Native floors" },
+  { key: "headline", hotkey: "h", label: "Only >=35" },
 ];
-// Filter floors are informational only -- the bins are already filtered by the
-// exporter; these strings just keep the HUD from lying about what is on screen.
-const FLOORS = { reference: "len >= 15", recreation: "len >= 15", reference5: "len >= 5 (their release)" };
 
 const MODES = [
   { key: "reference",  hotkey: "1", label: "Reference" },
   { key: "recreation", hotkey: "2", label: "Recreation" },
-  { key: "both",       hotkey: "3", label: "Both" },
-  { key: "reference5", hotkey: "4", label: "Ref @5" },
+  { key: "improved",   hotkey: "3", label: "Improved" },
+  { key: "overlay",    hotkey: "4", label: "Overlay" },
 ];
 
 // ============================================================
@@ -431,6 +479,7 @@ composer.addPass(new OutputPass());
 const systems = {};   // key -> TrackSystem
 const data = {};      // key -> trackData
 let mode = "reference";
+let floorMode = "matched";
 
 const hudTitle = document.getElementById("hud-title");
 const hudDot = document.getElementById("hud-dot");
@@ -444,66 +493,108 @@ function row(k, v) {
   return `<div><span>${k}</span><span class="v">${v}</span></div>`;
 }
 
+function dsOf(key) { return DATASETS.find((d) => d.key === key); }
+
+// The floor actually in force for a dataset under the current floor mode.
+function floorFor(key) {
+  if (floorMode === "native") return dsOf(key).native_floor;
+  if (floorMode === "headline") return META.headline_floor;
+  return META.matched_floor;
+}
+
+function purityText(ds) {
+  if (ds.purity_pct == null) return "not measured";
+  return ds.purity_pct.toFixed(1) + "%";
+}
+
 function statBlock(key) {
   const d = data[key];
   if (!d) return row("status", "missing");
-  return row("tracks", d.nTracks.toLocaleString())
-       + row("tracks &ge; 35", d.nGe35.toLocaleString())
-       + row("mean length", d.meanLength.toFixed(2) + " pts")
-       + row("points", d.totalPoints.toLocaleString())
-       + row("filter", FLOORS[key]);
+  const ds = dsOf(key);
+  const floor = floorFor(key);
+  const st = statsAtFloor(d, floor);
+  return row("floor in force", "len &ge; " + floor)
+       + row("tracks", st.n.toLocaleString())
+       + row("tracks &ge; 35", st.ge35.toLocaleString())
+       + row("mean length", st.meanLength.toFixed(2) + " pts")
+       + row("points", st.points.toLocaleString())
+       + row("purity", purityText(ds))
+       + row("native floor", "len &ge; " + ds.native_floor);
+}
+
+function floorBanner() {
+  if (floorMode === "native") {
+    return `<div style="margin-top:8px;color:#ffc65c;font-size:11px">` +
+      `NATIVE FLOORS &mdash; not like-for-like. Each run is drawn at the ` +
+      `min_track_length it published (5 / 15 / 8), so a run that emits shorter ` +
+      `tracks looks denser for that reason alone.</div>`;
+  }
+  if (floorMode === "headline") {
+    return `<div style="margin-top:8px;color:rgba(255,255,255,0.55);font-size:11px">` +
+      `Tracks &ge; 35 frames only &mdash; above every native floor here, so this ` +
+      `count is independent of the floor each run chose.</div>`;
+  }
+  return `<div style="margin-top:8px;color:rgba(255,255,255,0.55);font-size:11px">` +
+    `Matched floor &ge; ${META.matched_floor} on all three &mdash; the like-for-like view.</div>`;
 }
 
 function updateHUD() {
-  if (mode === "both") {
-    const ref = DATASETS[0], rec = DATASETS[1];
-    hudDot.style.background = "linear-gradient(90deg," + hex(ref.color) + " 50%," + hex(rec.color) + " 50%)";
-    hudTitle.textContent = "BOTH (overlay)";
-    statsEl.innerHTML =
-      `<div style="margin:6px 0 2px;color:${hex(ref.color)}">${ref.label}</div>` + statBlock("reference") +
-      `<div style="margin:8px 0 2px;color:${hex(rec.color)}">${rec.label}</div>` + statBlock("recreation");
+  if (mode === "overlay") {
+    hudDot.style.background = "linear-gradient(90deg," +
+      ORDER.map((k, i) => `${hex(COLORS[k])} ${i * 33.4}% ${(i + 1) * 33.4}%`).join(",") + ")";
+    hudTitle.textContent = "OVERLAY (all three)";
+    statsEl.innerHTML = ORDER.filter((k) => data[k]).map((k) =>
+      `<div style="margin:6px 0 2px;color:${hex(COLORS[k])}">${dsOf(k).label}</div>` + statBlock(k)
+    ).join("");
     legendEl.style.display = "block";
-    legendEl.innerHTML =
-      `<span class="dot" style="background:${hex(ref.color)}"></span>reference &nbsp;` +
-      `<span class="dot" style="background:${hex(rec.color)}"></span>recreation ` +
-      `<br />brightness = speed`;
+    legendEl.innerHTML = ORDER.filter((k) => data[k]).map((k) =>
+      `<span class="dot" style="background:${hex(COLORS[k])}"></span>${k}`).join(" &nbsp;") +
+      "<br />brightness = speed" + floorBanner();
   } else {
-    const ds = DATASETS.find((d) => d.key === mode);
-    hudDot.style.background = hex(ds.color);
+    const ds = dsOf(mode);
+    hudDot.style.background = hex(COLORS[mode]);
     hudTitle.textContent = ds.label;
     statsEl.innerHTML = statBlock(mode);
     legendEl.style.display = "block";
-    legendEl.innerHTML = "color = speed (jet, 0 &rarr; max)";
+    legendEl.innerHTML = "color = speed (jet, 0 &rarr; max, shared scale)" +
+      (ds.purity_note ? `<br />purity ${purityText(ds)} ${ds.purity_note}` : "") +
+      floorBanner();
   }
   for (const b of document.querySelectorAll("#modes button")) {
-    b.classList.toggle("active", b.dataset.mode === mode);
+    if (b.dataset.mode) b.classList.toggle("active", b.dataset.mode === mode);
+    if (b.dataset.floor) b.classList.toggle("active", b.dataset.floor === floorMode);
   }
 }
 
+function applyFloors() {
+  for (const [key, sys] of Object.entries(systems)) sys.setMinLength(floorFor(key));
+}
+
+function setFloorMode(next) {
+  if (!FLOOR_MODES.some((f) => f.key === next)) return;
+  floorMode = next;
+  applyFloors();
+  updateHUD();
+}
+
 function setMode(next) {
-  if (!systems[next] && next !== "both") return;
-  if (next === "both" && !(systems.reference && systems.recreation)) return;
+  if (next !== "overlay" && !systems[next]) return;
   mode = next;
-  // Camera and controls are never touched here -- the whole point is that the
-  // two datasets land on the same pixels when you flip between them.
+  // Camera, controls and the reveal clock are never touched here -- the whole
+  // point is that the three runs land on the same pixels at the same moment in
+  // the sweep when you flip between them.
   for (const [key, sys] of Object.entries(systems)) {
-    const on = mode === "both" ? (key === "reference" || key === "recreation") : key === mode;
-    sys.getObject3D().visible = on;
-    sys.setRenderParams({ useSolid: mode === "both" });
+    sys.getObject3D().visible = mode === "overlay" ? true : key === mode;
+    sys.setRenderParams({ useSolid: mode === "overlay" });
   }
   updateHUD();
 }
 
-function applyParams() {
-  for (const sys of Object.values(systems)) {
-    sys.setRenderParams({
-      pointSize: params.pointSize,
-      maxSpeed: params.maxSpeed,
-      colormap: params.colormap,
-      speedFilter: params.speedFilter,
-      useIntensity: params.useIntensity,
-    });
-  }
+function cycleMode(step) {
+  const live = ORDER.filter((k) => systems[k]);
+  if (!live.length) return;
+  const i = live.indexOf(mode);
+  setMode(live[(((i < 0 ? 0 : i + step) % live.length) + live.length) % live.length]);
 }
 
 function buildModeButtons() {
@@ -516,15 +607,34 @@ function buildModeButtons() {
     b.addEventListener("click", () => setMode(m.key));
     container.appendChild(b);
   }
+  const br = document.createElement("div");
+  br.style.flexBasis = "100%";
+  container.appendChild(br);
+  for (const f of FLOOR_MODES) {
+    const b = document.createElement("button");
+    b.textContent = `${f.hotkey}  ${f.label}`;
+    b.dataset.floor = f.key;
+    b.addEventListener("click", () => setFloorMode(f.key));
+    container.appendChild(b);
+  }
 }
 
 async function init() {
   buildModeButtons();
+  try {
+    META = await (await fetch("data/meta.json")).json();
+  } catch (err) {
+    errEl.textContent = "meta.json: " + err.message;
+    hudTitle.textContent = "No metadata";
+    return;
+  }
+  DATASETS = META.datasets;
+
   const loaded = [];
   for (const ds of DATASETS) {
     try {
       data[ds.key] = await loadTracks(ds.file);
-      systems[ds.key] = new TrackSystem(data[ds.key], ds.color);
+      systems[ds.key] = new TrackSystem(data[ds.key], COLORS[ds.key] ?? 0xffffff);
       scene.add(systems[ds.key].getObject3D());
       loaded.push(ds.key);
     } catch (err) {
@@ -561,6 +671,8 @@ async function init() {
   const gui = new GUI({ title: "Render" });
   gui.add(params, "speedMultiplier", 1, 240).name("Speed (frames/s)");
   gui.add(params, "pointSize", 0.05, 1.5).name("Point size").onChange(applyParams);
+  // One colormap ceiling for all three: the speed colouring is only comparable
+  // across datasets if they share the scale, so it is a single global control.
   const maxSpd = Math.max(...loaded.map((k) => data[k].maxSpeed));
   gui.add(params, "maxSpeed", 0.01, maxSpd).name("Colormap max speed").onChange(applyParams);
   gui.add(params, "speedFilter", 0, maxSpd).name("Speed filter").onChange(applyParams);
@@ -568,6 +680,7 @@ async function init() {
   gui.close();
 
   applyParams();
+  setFloorMode("matched");
   setMode(loaded.includes("reference") ? "reference" : loaded[0]);
 }
 
@@ -596,8 +709,13 @@ window.addEventListener("keydown", (e) => {
   if (e.target && /input|textarea/i.test(e.target.tagName)) return;
   const byHotkey = MODES.find((m) => m.hotkey === e.key);
   if (byHotkey) { setMode(byHotkey.key); e.preventDefault(); return; }
+  const byFloor = FLOOR_MODES.find((f) => f.hotkey === e.key.toLowerCase());
+  if (byFloor) { setFloorMode(byFloor.key); e.preventDefault(); return; }
   if (e.key === " " || e.key === "Tab") {
-    setMode(mode === "recreation" ? "reference" : "recreation");
+    // Cycles reference -> recreation -> improved. Camera and the shared reveal
+    // clock are untouched, so the three land on the same pixels at the same
+    // moment of the sweep.
+    cycleMode(e.shiftKey ? -1 : 1);
     e.preventDefault();
   } else if (e.key === "p" || e.key === "P") {
     params.paused = !params.paused;
