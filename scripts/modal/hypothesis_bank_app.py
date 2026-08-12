@@ -52,6 +52,125 @@ app = modal.App(f"{PROJECT}-hypothesis-bank")
 
 @app.function(image=gpu_image, gpu="A100-80GB", timeout=4 * 3600, memory=262144, cpu=16.0,
               volumes={"/root/data": vol})
+def bank_v3(n_acqs: int = 2, acq_start: int = 0, sigma_threshold: float = 2.0,
+            min_distance: int = 2, smoothing_sigma: float = 1.0) -> dict:
+    """The coherence test done correctly (mb-8t2).
+
+    bank_v2 took its detection coordinates from the POST-SVD volume but evaluated the
+    coherence ratio on the RAW pre-SVD per-angle field, where tissue clutter sits 25-40 dB
+    above the bubble. So it measured the 4-angle coherence of CLUTTER, which is static and
+    therefore flat in velocity by construction -- the flat 0.52 was guaranteed regardless of
+    what the bubble component does. That result is withdrawn; it refutes nothing about bubbles.
+
+    Here each angle stack is SVD-filtered on its own with the same adaptive cutoff BEFORE the
+    ratio is formed, so the ratio is evaluated in the subspace the detector actually works in.
+
+    PRE-REGISTERED, so this cannot be re-interpreted after the fact:
+      * flat at ~0.5 across velocity bands  -> the compounding-null line is dead. Abandon the
+        bank, and flip `compounding_gain_on` to default False in inject.py, since a refuted
+        notch hand-applied to injections biases every future axial recovery number downward.
+      * a sweep, or structure correlated with the velocity pick -> the bubble component is
+        point-like and velocity-coherent, and the bank earns one properly-powered rebuild.
+    """
+    import json
+    import sys
+    import time
+
+    sys.path.insert(0, "/workspace")
+    import h5py
+    import numpy as np
+    from scipy.ndimage import gaussian_filter, maximum_filter
+
+    from ultratrace_ulm.beamform_core import beamform_iq
+    from ultratrace_ulm.beamform_mach import _load_acq, _load_neutral_config
+    from ultratrace_ulm.svd import filter_svd_3d
+
+    class _Opts:
+        elev_planes = 25
+        z_coarseness = 0.5
+        x_coarseness = 0.5
+        large_fov = True
+        xlarge_fov = False
+        row_index = None
+        mean_subtract_channels = True
+
+    vol.reload()
+    out = []
+    with h5py.File(H5, "r") as h5:
+        config = _load_neutral_config(h5, _Opts())
+        attrs = dict(h5["config"].attrs)
+        lam_mm = float(config.speed_of_sound_m_s) / float(config.tx_freq_hz) * 1000.0
+        fr = float(attrs.get("frame_rate_hz", 222.4306816130359))
+        prf = 4.0 * fr
+        ids = [int(k) for k in sorted(h5["acquisitions"].keys(), key=int)][acq_start:acq_start + n_acqs]
+
+        for aid in ids:
+            t0 = time.time()
+            iq, txd, txd_e = _load_acq(h5, aid)
+            angles, _ = beamform_iq(iq, txd, txd_e, config, return_angles=True)
+            n_ang = angles.shape[0]
+
+            # per-angle SVD filtering, same adaptive cutoff, complex output retained
+            filt = np.stack([filter_svd_3d(angles[a], method="adaptive", frame_rate_hz=fr)
+                             for a in range(n_ang)], axis=0).astype(np.complex64)
+            del angles
+
+            # detections from the standard (summed-then-filtered) path, unchanged
+            std_mag = np.abs(filter_svd_3d(filt.sum(axis=0), method="adaptive",
+                                           frame_rate_hz=fr)).astype(np.float32)
+            sm = gaussian_filter(std_mag, sigma=(0, 0, smoothing_sigma, smoothing_sigma))
+            n_elev = sm.shape[1]
+            mean = np.zeros(n_elev, np.float32); sd = np.ones(n_elev, np.float32)
+            for e in range(n_elev):
+                pos = sm[:, e][sm[:, e] > 0]
+                if pos.size:
+                    mean[e] = pos.mean(); s = pos.std(); sd[e] = s if s > 1e-10 else 1.0
+            z = (sm - mean[None, :, None, None]) / (sd[None, :, None, None] + 1e-10)
+            fs = 2 * int(min_distance) + 1
+            pk = (z == maximum_filter(z, size=(1, fs, fs, fs))) & (z > sigma_threshold)
+            idx = tuple(np.array(np.where(pk)))
+            zs = z[pk]
+
+            pa = filt[(slice(None),) + idx]
+            ratio = (np.abs(pa.sum(axis=0)) / np.maximum(np.abs(pa).sum(axis=0), 1e-20))
+            # per-detection axial phase slope across the 4 transmits -> implied velocity
+            ph = np.angle(pa[1:] * np.conj(pa[:-1]))          # (A-1, N) inter-transmit phase
+            slope = np.angle(np.exp(1j * ph).mean(axis=0))
+            v_implied = slope * (lam_mm / 1000.0) * prf / (4.0 * np.pi) * 1000.0
+
+            bands = []
+            for lo, hi in ((0, 20), (20, 40), (40, 60), (60, 80), (80, 100), (100, 131)):
+                m = (np.abs(v_implied) >= lo) & (np.abs(v_implied) < hi)
+                if m.sum() < 50:
+                    continue
+                vm = float(np.median(np.abs(v_implied[m])))
+                d = 4.0 * np.pi * (vm / 1000.0) / ((lam_mm / 1000.0) * prf)
+                pred = abs(np.sin(2 * d) / (4 * np.sin(d / 2))) if d else 1.0
+                bands.append({"band": [lo, hi], "n": int(m.sum()), "v_median": round(vm, 1),
+                              "observed_ratio": round(float(np.median(ratio[m])), 4),
+                              "predicted_ratio": round(float(pred), 4)})
+
+            rec = {"acq": str(aid), "n_detections": int(len(zs)),
+                   "ratio_median_all": round(float(np.median(ratio)), 4),
+                   "ratio_p10": round(float(np.percentile(ratio, 10)), 4),
+                   "ratio_p90": round(float(np.percentile(ratio, 90)), 4),
+                   "speckle_value_1_over_sqrtA": round(float(1 / np.sqrt(n_ang)), 4),
+                   "bands": bands, "seconds": round(time.time() - t0, 1)}
+            print("[acq %s] " % aid + json.dumps(rec, indent=2), flush=True)
+            out.append(rec)
+            del filt, std_mag, sm, z
+            vol.commit()
+
+    rep = {"lambda_mm": round(lam_mm, 4), "acqs": out}
+    with open(f"{DATA_ROOT}/hypothesis_bank_v3.json", "w") as fh:
+        json.dump(rep, fh, indent=2)
+    vol.commit()
+    print("BANK_V3 " + json.dumps(rep, indent=2), flush=True)
+    return rep
+
+
+@app.function(image=gpu_image, gpu="A100-80GB", timeout=4 * 3600, memory=262144, cpu=16.0,
+              volumes={"/root/data": vol})
 def bank_v2(n_acqs: int = 2, acq_start: int = 0, v_max: float = 130.0, n_hyp: int = 13,
             sigma_threshold: float = 2.0, min_distance: int = 2,
             smoothing_sigma: float = 1.0) -> dict:
