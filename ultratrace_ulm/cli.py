@@ -77,6 +77,16 @@ def add_tracking_args(parser: argparse.ArgumentParser, require_beamformed: bool 
         help="Tissue/blood frequency boundary (Hz) for adaptive SVD.",
     )
     parser.add_argument(
+        "--tissue-velocity",
+        dest="tissue_velocity_mm_s",
+        type=float,
+        default=None,
+        help=(
+            "Tissue/blood boundary as an axial velocity (mm/s), converted to Hz "
+            "per file via f = 2*v*f0/c. Carrier-invariant; overrides --tissue-freq."
+        ),
+    )
+    parser.add_argument(
         "--filter",
         dest="filter_method",
         choices=["svd", "none"],
@@ -122,7 +132,7 @@ def cmd_track_export(args: argparse.Namespace) -> None:
 
 
 def cmd_download(args: argparse.Namespace) -> None:
-    download_sample(args.url, args.output, force=args.force)
+    download_sample(args.url, args.output, force=args.force, downloader=args.downloader)
 
 
 def _stage(label: str) -> None:
@@ -145,7 +155,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             if raw_input.exists() and not args.force:
                 print(f"Using existing {raw_input} (--force to re-download)")
             else:
-                download_sample(args.url, raw_input, force=args.force)
+                download_sample(args.url, raw_input, force=args.force, downloader=args.downloader)
 
         # 2. Beamform raw -> beamformed.h5
         beamformed = work / "beamformed.h5"
@@ -288,11 +298,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "download",
-        help="Download the public sample ultratrace (resumable, ~98 GB).",
+        help="Download the public sample ultratrace (resumable, ~96 GB).",
     )
     p.add_argument("-o", "--output", default=SAMPLE_FILENAME, help="Destination path.")
     p.add_argument("--url", default=SAMPLE_URL, help="Source URL.")
     p.add_argument("--force", action="store_true", help="Re-download even if present.")
+    p.add_argument(
+        "--downloader",
+        choices=("auto", "aria2", "urllib"),
+        default="auto",
+        help="Download backend: auto uses aria2c when installed, else urllib.",
+    )
     p.set_defaults(func=cmd_download)
 
     p = sub.add_parser(
@@ -304,7 +320,13 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--beamformed", help="Existing beamformed H5 (skip beamform).")
     p.add_argument("--url", default=SAMPLE_URL, help="Sample URL when downloading.")
     p.add_argument("--work-dir", default="outputs", help="Output directory for all artifacts.")
-    p.add_argument("--frame-rate", dest="frame_rate", type=float, default=222.0)
+    p.add_argument(
+        "--frame-rate",
+        dest="frame_rate",
+        type=float,
+        default=None,
+        help="Compounded frame rate (Hz). Default: read from the beamformed file.",
+    )
     p.add_argument("--svd-method", choices=["fast", "full", "adaptive", "none"], default="adaptive")
     p.add_argument("--spatial-tgc", action="store_true", help="Spatial TGC during beamforming.")
     p.add_argument("--min-length", type=int, default=35, help="Min track length for the viewer.")
@@ -314,6 +336,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--acq-step", type=int, default=1)
     p.add_argument("--all-acqs", action="store_true", help="Beamform every acquisition.")
     p.add_argument("--force", action="store_true", help="Re-run stages whose outputs exist.")
+    p.add_argument(
+        "--downloader",
+        choices=("auto", "aria2", "urllib"),
+        default="auto",
+        help="Download backend: auto uses aria2c when installed, else urllib.",
+    )
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("beamform", help="MACH-only beamform selected acquisitions.")

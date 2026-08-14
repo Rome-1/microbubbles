@@ -27,7 +27,8 @@ This project uses [uv](https://docs.astral.sh/uv/). From the repo root:
 
 ```bash
 uv sync                 # core: download + tracking + viewers (creates .venv)
-uv sync --extra mach    # + GPU MACH beamforming (CUDA host only)
+uv sync --extra mach-cuda12   # + GPU MACH beamforming, CUDA 12.x host
+uv sync --extra mach-cuda13   # + GPU MACH beamforming, CUDA 13.x host
 ```
 
 `uv sync` installs the exact, locked versions (`uv.lock`). Run any command with
@@ -53,7 +54,7 @@ Already have a beamformed file? Skip download and beamforming:
 ultratrace-ulm run --beamformed beamformed.h5 --frame-rate 222
 ```
 
-> `run` downloads ~98 GB and beamforms on a CUDA GPU. To avoid both, pass
+> `run` downloads ~96 GB and beamforms on a CUDA GPU. To avoid both, pass
 > `--beamformed`. For full control over any stage, use the dedicated
 > subcommands below instead.
 
@@ -76,9 +77,13 @@ Run `ultratrace-ulm <command> --help` for the complete flag list of any command.
 
 ### download
 
-Resumable download (pure stdlib, no `curl` needed). A sanitized neutral
+Resumable download. Uses [aria2](https://aria2.github.io/) (`aria2c`) for
+parallel-connection downloads when it is installed (`brew install aria2` /
+`apt install aria2` — recommended for this file size), and falls back to a
+pure-stdlib sequential downloader otherwise; `--downloader` forces a specific
+backend. A sanitized neutral
 ultratrace — demodulated IQ plus transmit delays and a beamforming-only config,
-no raw frames or device metadata — hosted on Cloudflare R2 (~98 GB, 223
+no raw frames or device metadata, with the full 8-row elevation receive aperture preserved for true 3D reconstruction — hosted on Cloudflare R2 (~96 GB, 216
 acquisitions):
 
 ```bash
