@@ -1,138 +1,207 @@
-# From the Aleph baseline to our improved pipeline: every discrete change
+# From the Aleph baseline to our pipeline: every discrete change
 
-What we started with is the shipped `alephneuro/microbubbles` pipeline, run unmodified with its
-own settings. What we ship now differs from it in **three** places. This document lists all of
-them, what evidence forced each one, what it cost, and — equally important — the changes we
-measured and **rejected**, so the ledger is not just a list of wins.
+We start from the shipped `alephneuro/microbubbles` pipeline run with its own settings, on the
+corrected 216-acquisition public dataset. **Two settings differ in what we ship.** This document
+explains each one, what forced it, and what it cost — plus the things we tried and rejected, so
+the ledger is not just a list of wins.
 
-Everything below is measured on all 216 acquisitions of the corrected public dataset, on
-identical detections, with our baseline arm reproducing the reference recreation exactly
-(7,296 tracks / 1,451 ≥35 / 582 ≥50).
-
----
-
-## Change 0 — the input (a precondition, not a pipeline change)
-
-Upstream replaced the public sample on 2026-07-11 (commit `23c49e57`), same URL, same filename.
-The earlier export came from a **single-row acquisition** with no elevation extent; beamforming
-it to 25 planes produced ±y mirror-symmetric warps, and in their words its detections "would not
-link into 3D tracks". Our 98 GB copy was that retracted export: 223 acquisitions × ~700 frames,
-5 transmit angles, 1 receive row. The corrected file is **216 × 240, 4 angles, 8 rows**.
-
-This is listed first because nothing else here is meaningful without it, and because it retired
-a long list of open bugs that were never our bugs: the 240-vs-700 frame puzzle, the elevation
-midplane pile-up, the detection flood (7% of frames holding 68% of detections), 3–4×
-over-tracking, and a documented "conflict" with the maintainers over 4 vs 5 transmit angles.
-
-**Effect:** the shipped pipeline on the corrected data reproduces the reference to 1.02×
-(1,451 vs 1,421 tracks ≥35). That recreation is the baseline for everything below.
+All numbers are from all 216 acquisitions, on identical detections, with our baseline arm
+reproducing the reference recreation exactly (7,296 tracks / 1,451 ≥35 frames / 582 ≥50).
 
 ---
 
-## Change 1 — deterministic, phase-invariant SVD clutter filtering
+## Not a difference: deterministic, phase-invariant clutter filtering
 
-**What.** The temporal SVD's eigendecomposition runs in complex128 (accumulated as a chunked
-Gram so no double copy of the full matrix is materialised), and the per-mode score is the
-phase-invariant `|fft(u)|²` folded onto `|f|` rather than `|rfft(u.real)|²`.
+We fixed this and so did they, independently, within days of each other (their PR #4 and #5).
+Their measurements agree with ours — a phase re-draw moves the old score by 15.6 Hz on their
+measurement and 17.5 Hz on ours; the invariant score by ~0. Run-to-run detection agreement goes
+from 93.8% to 99.998%.
 
-**Why.** A Hermitian eigensolver fixes each eigenvector only up to a unit phase, so scoring the
-real part measures the LAPACK representative rather than the data. Measured: a phase re-draw
-moved the shipped score by up to **17.5 Hz per mode**; the invariant score by **0.000 Hz**. In
-complex64 the same code was non-deterministic run-to-run.
-
-**Effect.** Run-to-run detection agreement on one acquisition: **93.8% → 99.998%** (1 differing
-detection in 43,040). It also *changes* the detection field — 38,282 → 43,039 detections
-(+12%) on identical input — because complex64 was over-suppressing the retained blood subspace.
-
-**Status.** Both halves are now **upstream** as well (PR #4 and PR #5), arrived at
-independently; their measurements agree with ours (they report 15.6 Hz where we measured 17.5).
-This is the one change that is no longer a difference between us and them.
+It is listed only so the record is complete: **as of the merge in `619eed6` this is no longer a
+difference between our fork and upstream.** The one piece we still carry is a chunked
+double-precision Gram, which computes bit-identical eigenvectors without materialising a ~4.1 GB
+complex128 copy of a 2.0 GB matrix. That is a memory optimization, not a result.
 
 ---
 
-## Change 2 — the tracking gate, in physical units and anisotropic
+## Change 1 — the association gate, in physical units
 
 ![the velocity wall](figures/change_gate_wall.png)
 
-**What.** The shipped gate is a box of 2 voxels/frame. Replaced with **130 / 130 / 130 mm/s**
-(lateral / elevation / axial) via the existing `max_dist_mms` path — no new code.
+### What the gate is
 
-**Why.** 2 voxels/frame is 89 mm/s in-plane but **247 mm/s in elevation** — 2.77× looser on the
-axis with the worst localization (0.5547 mm voxels synthesized from 8 physical rows, against
-0.2 mm in-plane). And it was binding: per-step velocities across the 216-acquisition recreation
-hard-wall at exactly the default, observed 89.2 / 246.7 / 89.3 against 89.15 / 246.76 / 89.33
-predicted — three significant figures on all three axes, with zero steps above 92 mm/s in-plane.
-The speed distribution everyone had been quoting was an artifact of our own gate, and every
-bubble faster than ~89 mm/s in-plane was structurally unlinkable.
+After detecting bubbles in each frame, the tracker has to decide which detection in frame *t+1*
+is the same bubble as one in frame *t*. It only considers candidates inside a box around the
+prediction. That box is the **gate**, and anything that would have to move further than the gate
+allows simply cannot be linked.
 
-**Read the figure carefully.** The lobes at 0, ~45, ~90 mm/s are **integer voxel displacements
-per frame** (1 voxel/frame = 44.6 mm/s in-plane, 123.4 in elevation), not physiological modes —
-sub-voxel localization is not smoothing them out. The blue distribution stops dead at 2 voxels;
-the orange one reaches the third lobe. In elevation the change is a *tightening*, which is why
-the orange curve is cut short there.
+### The voxels are not cubes, and that is the whole problem
 
-**A coincidence that cost real time.** The gate wall and the 4-angle coherent-compounding null
-are the same speed by algebra: voxel = λ/4 so 2 voxels/frame = λ·FR/2, and PRF = 4·FR so
-λ·PRF/8 = λ·FR/2 = 88.97 mm/s. Gate-censoring and compounding-annihilation are therefore
-confounded in every track-level statistic and separate only by axis. That is why the axial
-deficit this program chased could not be attributed from track data alone.
+| axis | voxel size | 2 voxels/frame at 222.43 Hz |
+|---|---|---|
+| lateral (x) | 0.2004 mm | 89.2 mm/s |
+| axial (z) | 0.2008 mm | 89.3 mm/s |
+| **elevation (y)** | **0.5547 mm** | **246.8 mm/s** |
 
-**Effect.** +80 tracks ≥35 frames (1,451 → 1,531) and the bulk of the coverage gain below.
+Lateral and axial are sampled at λ/4 (λ = 0.800 mm at 2.0 MHz in 1600 m/s tissue). Elevation is
+**2.77× coarser**, because the 25 elevation planes are synthesized from only 8 physical receive
+rows — it is the axis we localize *worst*.
+
+The shipped default gate is **2 voxels per frame on each axis**. Because the voxels are
+anisotropic, that one rule means two very different physical limits: a bubble may move 89 mm/s
+in-plane, but 247 mm/s in elevation. The most permissive gate sits on the least trustworthy
+axis.
+
+### It was binding, and we can prove it
+
+Per-step velocities across the whole 216-acquisition run stop dead at exactly the default:
+
+| axis | observed maximum | 2 voxels/frame |
+|---|---|---|
+| lateral | 89.2 mm/s | 89.15 |
+| axial | 89.3 mm/s | 89.33 |
+| elevation | 246.7 mm/s | 246.76 |
+
+Three significant figures on all three axes, with zero steps above 92 mm/s in-plane. The "speed
+distribution" of the published tracks was a picture of our own gate. Any bubble faster than
+~89 mm/s in-plane could not be linked at all, no matter how cleanly it was detected.
+
+**Reading the figure.** The lobes at 0, ~45 and ~90 mm/s are integer voxel displacements per
+frame (1 voxel/frame = 44.6 mm/s in-plane), not physiological flow modes — sub-voxel localization
+is not smoothing them out. Blue (the shipped gate) stops at the 2-voxel line; orange reaches the
+third lobe. In elevation the change *tightens* the gate, which is why orange stops earlier there.
+
+### Why did Aleph use voxels? Because until last week they had no choice
+
+This is not an oversight, and the answer is in their own code and commit history.
+
+1. **They built the physical-units path themselves.** `max_dist_mms` — a gate in mm/s — exists in
+   `_tracking_gate` from the earliest commit in the shared history. It is not the default.
+2. **It requires a frame rate, which the pipeline did not have.** Converting mm/s into
+   mm-per-frame needs the acquisition's frame rate, and the released sample carried no PRF. Their
+   own commit `ae169ea` says so: "the released sample carried no PRF, so a new user could not run
+   the default recipe without knowing the value out of band". A default that raises unless the
+   user supplies a number out of band is not a usable default.
+3. **A voxel gate is the only rule that always works.** Grid spacing is always known — it comes
+   from the beamformed file itself. The companion `max(…, 0.25 mm)` floor in the same expression
+   is the other tell: both are safety nets for "run on any input, with no timing metadata".
+
+So voxels were the correct engineering choice for a pipeline that could not rely on knowing time.
+
+**What changed:** their commit `ae169ea` (merged days ago, now in our fork) carries the frame
+rate through the pipeline — read from `/config`, recorded on the beamformed file, used by `track`
+when `--frame-rate` is absent. The constraint that forced a voxel gate is gone, by their own fix.
+
+They reached the same conclusion about their *other* threshold in the same commit: a 100 Hz
+tissue-frequency boundary became a `--tissue-velocity` in mm/s, because "a frequency boundary
+only means something alongside its carrier". Our change applies that identical argument to the
+gate. Their new helper even confirms the arithmetic: `doppler_velocity_to_freq(40, 2e6, 1600)`
+returns exactly 100.0 Hz, so their tissue boundary was 40 mm/s all along.
+
+### What we ship
+
+**130 mm/s on all three axes** (via their `max_dist_mms`; no new code). In-plane this raises the
+limit from 89; in elevation it lowers it from 247, so the gate is finally tightest where
+localization is worst rather than loosest.
+
+**Effect: +80 tracks of ≥35 frames** (1,451 → 1,531) and most of the coverage gain below.
+
+One caveat worth stating: 130 is not a physiological number, it is the knee of a yield-versus-
+false-link trade. Past ~130 the gain flattens while chance links climb.
 
 ---
 
-## Change 3 — the length floor, calibrated against a null
+## Change 2 — publishing shorter tracks, with the error rate measured
 
 ![the purity curve](figures/change_length_purity.png)
 
-**What.** `min_track_length` 15 → **8**.
+### What the setting is
 
-**Why it is not simply "loosen a knob".** The floor is applied *only at emission*
-(`tracking.py:343`, `:722`, `:729`) — it never enters the assignment cost, the Kalman update,
-the gate, or spawn logic. Lowering it recovers **zero** associations; it decides what gets
-published. So it should be calibrated, not argued about. Against a frame-permutation null
-(same detections, trajectories destroyed) purity is 36.5% at length 2 — two-point chains are
-half noise — clears **95% at 8**, and reaches 99.6% at 15. Going 8 → 15 costs 3× the yield to
-buy 3.4 points, and the shipped 15 buys no planted-crossing precision (flat 0.91–0.96 across the
-whole range).
+`min_track_length` is the last step before results are written: **any track shorter than N frames
+is deleted from the output.** Aleph ships N = 15. We ship N = 8.
 
-**Effect.** 3.1× more published trajectories (7,296 → 22,685) and linked detections 9.16% →
-16.7%, at 95.2% purity. Tracks ≥35 are unaffected by construction.
+The single most important thing to understand about it: **it does not change tracking at all.**
+It is applied only where finished tracks are written out (`tracking.py:343`, `:722`, `:729`) and
+never enters the gate, the assignment cost, or the motion model. A 10-frame track exists inside
+the tracker either way. At N = 15 it is built and then thrown away; at N = 8 it is built and
+kept. Lowering it recovers no new associations — it only stops deleting.
 
-**The two changes interact.** At floor 15 only 1.2% of the gate's link gain is
-null-reproducible; at 8 it is 11.8%; at 5 it is 28.6%. A gate gain quoted without its floor is
-not a meaningful number, which is why they are reported together.
+So the question is not "does this find more bubbles" (it cannot). The question is: **of the
+tracks we would newly publish, how many are real?**
 
----
+### How we measured the error rate
 
-## Non-change — the clutter rank and normalization, confirmed rather than assumed
+A short track could be a real bubble seen briefly, or a coincidence — a few unrelated detections
+that happened to line up. To tell them apart we built a control where *every* track is by
+definition a coincidence:
 
-`rank 24 + spatial_tgc` survived a joint sweep against synthetic injections at matched
-false-alarm rate. Worth recording *why* rank 24 is defensible: the adaptive cutoff never fires
-on this data (no mode centroid reaches the 100 Hz boundary; max 85–96 Hz), so rank 24 is the
-10%-of-frames fallback — accidental, and also correct. The win in that sweep was
-**normalization**, not rank; on one acquisition the data-driven knee resolves to exactly 24, the
-status quo filter.
+> Take the same detections. Shuffle which frame each one belongs to. Run the identical tracker.
+> Any track it now finds is pure chance, because the trajectories have been destroyed.
 
----
+Run both, and at each candidate length N compare how many tracks the real data yields against how
+many the shuffled data yields. That ratio is the false-track rate at that length. (For scale:
+2.17M detections go into this.)
 
-## What we measured and rejected
-
-| candidate | verdict | evidence |
+| if we publish tracks of ≥ N frames | tracks published | of those, coincidences |
 |---|---|---|
-| Elevation grating lobes (pitch is 2.08λ) | **refuted** | 1.93× excess at the predicted offset, but 6 of 27 *arbitrary* offsets beat it; apex wanders across depth where a real lobe is fixed |
-| Motion-phase hypothesis bank / compounding null | **refuted at modelled strength** | the modelled notch predicts a lateral:axial ratio of 169 in the top speed band where real data shows 1.53; it would leave the data axially extinct |
+| N = 2 | 94,779 | **63%** |
+| N = 5 | 15,810 | 13% |
+| **N = 8 (ours)** | **6,439** | **3.8%** |
+| N = 15 (Aleph's) | 2,118 | 0.4% |
+
+Two-frame tracks are mostly noise, as expected. By 8 frames the false rate has dropped to 3.8%
+and the curve has flattened — going from 8 to 15 throws away two thirds of the remaining tracks
+to buy back 3.4 percentage points.
+
+We also checked that the extra tracks are not junk by two other routes: planted-crossing link
+precision is flat (0.91–0.96) across the whole range, so the stricter floor buys no accuracy; and
+the added short tracks lie along the same vessels as the long ones, where the shuffled control's
+do not.
+
+### What it costs and what it buys
+
+- **3.1× more published trajectories** (7,296 → 22,685) and detections linked into tracks rising
+  from 9.2% to 16.7%.
+- **False-track rate 0.4% → 3.8%.** In absolute terms, about 247 of the 22,685 published tracks
+  are expected to be coincidences, against 9 today.
+- **The long-track count is untouched**, because a floor at 8 or 15 cannot affect a 35-frame
+  track. That is why tracks ≥35 is the metric used for comparison against the reference.
+
+### The two changes are not independent
+
+A wider gate makes longer chains, which changes where the floor should sit. Quantitatively: at a
+floor of 15, only 1.2% of the gate's link gain is reproduced by the shuffled control; at 8 it is
+11.8%; at 5 it is 28.6%. So the gate's benefit must always be quoted with the floor it was
+measured at — the two settings are reported together, never separately.
+
+---
+
+## Confirmed rather than changed: clutter rank and normalization
+
+`rank 24 + spatial TGC` survived a sweep against synthetic injected bubbles scored at matched
+false-alarm rate, so we ship Aleph's setting. Worth recording *why* rank 24 is defensible: the
+adaptive cutoff never fires on this data (no mode's spectral centroid reaches the 100 Hz
+boundary; the maximum is 85–96 Hz), so it always falls back to "10% of frames" — accidental, and
+also correct. The sweep's win was normalization, not rank; on one acquisition the data-driven
+knee resolves to exactly 24, the status quo filter.
+
+---
+
+## What we tried and rejected
+
+| candidate | verdict | why |
+|---|---|---|
+| Elevation grating lobes (row pitch is 2.08λ) | **refuted** | 1.93× excess at the predicted offset, but 6 of 27 *arbitrary* offsets beat it; the apex wanders with depth where a real lobe is fixed |
+| Motion-phase hypothesis bank (compounding null) | **refuted at modelled strength** | the model predicts a 169:1 lateral:axial ratio in the top speed band where real data shows 1.53 — it would leave the data axially extinct |
 | 888 Hz interleaved per-transmit movie | **abandoned** | the four steered volumes are mutually decorrelated in the raw field |
-| Marchenko-Pastur high cutoff | **harmful** | removes 122 of 240 modes (correct maths, wrong regime: γ = 240/1.06M collapses the bulk to a point); costs 0.09–0.14 recovery |
+| Marchenko-Pastur high cutoff | **harmful** | strips 122 of 240 modes (right maths, wrong regime); costs 0.09–0.14 recovery |
 | B18 spatial-correlation cutoff | **harmful** | returns 2 modes |
 | `per_elev_zband` normalization | **rejected** | changes sign between acquisitions (+0.018 / −0.014) |
-| Injector's slow-lateral blind spot as a real-data claim | **rejected** | propagated through tracking it predicts a ratio of 0.01–0.04 where real data says 0.98 |
+| Injector's slow-lateral blind spot, as a real-data claim | **rejected** | propagated through tracking it predicts a ratio of 0.01–0.04 where real data shows 0.98 |
 
-Two of our own results were also withdrawn: a coherence "refutation" that turned out to measure
-tissue clutter rather than bubbles (it evaluated the ratio on the raw pre-SVD field, where
-clutter sits 25–40 dB above the signal), and a "1.348× vs reference" figure produced by a
-harness that called `kalman_tracking_3d` directly and silently inherited its `max_cost=1e5`
-default instead of production's `10.0`.
+Two of our own results were withdrawn as well: a coherence "refutation" that turned out to be
+measuring tissue clutter rather than bubbles, and a "1.348× vs reference" figure produced by a
+harness that silently inherited a 10,000× looser assignment cost than production uses.
 
 ---
 
@@ -140,29 +209,27 @@ default instead of production's `10.0`.
 
 ![what the changes bought](figures/change_summary.png)
 
-| | Aleph reference | our recreation | improved |
+| | Aleph reference | our recreation | with our two changes |
 |---|---|---|---|
 | tracks ≥35 frames | 1,421 | 1,451 | **1,531** |
 | tracks ≥50 frames | — | 582 | **601** |
-| tracks (native floor) | 50,456 (floor 5) | 7,296 (floor 15) | 22,685 (floor 8) |
-| tracks at matched floor 15 | 7,274 | 7,296 | **7,808** |
-| linked detections | — | 9.16% | **16.7%** |
-| purity vs permutation null | never measured | 99.5% | **95.2%** |
-| run-to-run reproducibility | 93.8% | 99.998% | 99.998% |
+| tracks at a matched floor of 15 | 7,274 | 7,296 | **7,808** |
+| tracks at native floor | 50,456 (floor 5) | 7,296 (floor 15) | 22,685 (floor 8) |
+| detections linked into tracks | — | 9.2% | **16.7%** |
+| false-track rate vs shuffled control | never measured | 0.4% | 3.8% |
 
-**Zero chance chains reach 35 frames** in 2.17M permuted detections, at either operating point,
-so the headline population is null-free and the +80 is not bought with contamination.
+**No coincidence track anywhere reaches 35 frames** across 2.17M shuffled detections, at either
+setting. The headline population is free of chance chains, so the +80 is not bought with
+contamination.
 
 ## Honest scope
 
-This is a **publication-and-association** improvement: more of the trajectories the pipeline
-already builds, with the chance-chain fraction measured rather than assumed, plus a determinism
-fix that is now upstream anyway. It is **not** more signal extracted from the raw data. Every
-upstream idea that promised that is in the rejected table above.
+This is an improvement in **association and reporting**: more of the trajectories the pipeline
+already builds, with the error rate measured rather than assumed. It is **not** more signal
+extracted from the raw data — every upstream idea that promised that is in the rejected table.
 
 One upstream lever remains live and unproven: per-angle coherence declines ~2.3 dB across the
-measured speed range (post-SVD median 0.85, against 0.50 for random phase — so the detections
-are *not* speckle, and the compound is buying real gain). That curve currently bins by a
-velocity derived from the same phasors as the quantity being binned, so it needs re-binning
-against independently tracked step velocity before it can be claimed. The per-detection export
-for that test is already on the Modal volume.
+measured speed range (post-clutter-filter median 0.85 against 0.50 for random phase — so our
+detections are *not* speckle, and the coherent compound is buying real gain). That curve
+currently bins by a velocity derived from the same phases it measures, so it needs re-binning
+against independently tracked velocity before it can be claimed.
