@@ -24,7 +24,7 @@ complex128 copy of a 2.0 GB matrix. That is a memory optimization, not a result.
 
 ---
 
-## Change 1 — the association gate, in physical units
+## Change 1 — the in-plane association gate, in physical units
 
 ![the velocity wall](figures/change_gate_wall.png)
 
@@ -71,43 +71,60 @@ frame (1 voxel/frame = 44.6 mm/s in-plane), not physiological flow modes — sub
 is not smoothing them out. Blue (the shipped gate) stops at the 2-voxel line; orange reaches the
 third lobe. In elevation the change *tightens* the gate, which is why orange stops earlier there.
 
-### Why did Aleph use voxels? Because until last week they had no choice
+### Why the elevation gate is *not* a mistake — and why our first recommendation was
 
-This is not an oversight, and the answer is in their own code and commit history.
+A gate has to cover two different things at once: how far a bubble can really move in a frame,
+**and** how far our estimate of its position can be wrong. Voxel size is a reasonable proxy for
+the second. Elevation voxels are 2.77× larger because elevation is resolved 2.77× worse, so a
+gate specified in voxels automatically opens wider on the axis where localization is least
+certain. That is the gate doing its second job, and it is defensible.
 
-1. **They built the physical-units path themselves.** `max_dist_mms` — a gate in mm/s — exists in
-   `_tracking_gate` from the earliest commit in the shared history. It is not the default.
-2. **It requires a frame rate, which the pipeline did not have.** Converting mm/s into
-   mm-per-frame needs the acquisition's frame rate, and the released sample carried no PRF. Their
-   own commit `ae169ea` says so: "the released sample carried no PRF, so a new user could not run
-   the default recipe without knowing the value out of band". A default that raises unless the
-   user supplies a number out of band is not a usable default.
-3. **A voxel gate is the only rule that always works.** Grid spacing is always known — it comes
-   from the beamformed file itself. The companion `max(…, 0.25 mm)` floor in the same expression
-   is the other tell: both are safety nets for "run on any input, with no timing metadata".
+Our first version of this document called the anisotropy "backwards" and tightened elevation to
+130 mm/s to match the in-plane axes. That was wrong, and the evidence against it was already in
+`outputs/gate_sweep/` when the claim was made. Over 60 acquisitions, tracks ≥35 frames:
 
-So voxels were the correct engineering choice for a pipeline that could not rely on knowing time.
+| gate (in-plane / elevation) | tracks ≥35 |
+|---|---|
+| 89 / 247 — Aleph default | 372 |
+| 130 / 130 — our first recommendation | 397 |
+| **130 / 247 — in-plane only** | **477** |
 
-**What changed:** their commit `ae169ea` (merged days ago, now in our fork) carries the frame
-rate through the pipeline — read from `/config`, recorded on the beamformed file, used by `track`
-when `--frame-rate` is absent. The constraint that forced a voxel gate is gone, by their own fix.
+Tightening elevation gave away 80 of the 105 available long tracks. On the full dataset the same
+choice costs 253 (1,784 against 1,531). Velocity units are the right way to express a *motion*
+limit; they are the wrong way to express a *precision* limit, and elevation is dominated by the
+latter.
 
-They reached the same conclusion about their *other* threshold in the same commit: a 100 Hz
-tissue-frequency boundary became a `--tissue-velocity` in mm/s, because "a frequency boundary
-only means something alongside its carrier". Our change applies that identical argument to the
-gate. Their new helper even confirms the arithmetic: `doppler_velocity_to_freq(40, 2e6, 1600)`
-returns exactly 100.0 Hz, so their tissue boundary was 40 mm/s all along.
+### Why did Aleph use voxels?
+
+The honest answer is the one above: **a voxel gate scales with per-axis localization
+uncertainty, and on the elevation axis that is the dominant term.** Measured on this data, that
+scaling is worth 253 long tracks over the physical-units alternative we first proposed. It is a
+better default than it looks.
+
+Two supporting facts, which are context rather than explanation. They built the physical-units
+path themselves — `max_dist_mms` is in `_tracking_gate` from the earliest commit in the shared
+history, simply not as the default. And a voxel rule always works, because grid spacing comes
+from the beamformed file whereas a mm/s rule needs a frame rate; their commit `ae169ea` has now
+made the frame rate available by carrying it through `/config`. But neither is a *justification*
+for their own default — they wrote the pipeline and have always known their own frame rate. The
+justification is the uncertainty scaling.
+
+They reached the same conclusion in reverse for their *tissue* threshold in `ae169ea`, replacing
+a 100 Hz boundary with `--tissue-velocity` in mm/s because "a frequency boundary only means
+something alongside its carrier". Their new helper confirms the arithmetic —
+`doppler_velocity_to_freq(40, 2e6, 1600)` is exactly 100.0 Hz, so their boundary was 40 mm/s all
+along. Physical units are right for a threshold on *motion*. The gate is partly a threshold on
+*precision*, which is why only its in-plane half should move.
 
 ### What we ship
 
-**130 mm/s on all three axes** (via their `max_dist_mms`; no new code). In-plane this raises the
-limit from 89; in elevation it lowers it from 247, so the gate is finally tightest where
-localization is worst rather than loosest.
+**Raise the in-plane gate to 130 mm/s. Leave elevation exactly as Aleph had it.** One axis, not
+three, via their own `max_dist_mms` — no new code.
 
-**Effect: +80 tracks of ≥35 frames** (1,451 → 1,531) and most of the coverage gain below.
+**Effect: +333 tracks of ≥35 frames** (1,451 → 1,784, +23%) and +135 of ≥50 frames (582 → 717).
 
-One caveat worth stating: 130 is not a physiological number, it is the knee of a yield-versus-
-false-link trade. Past ~130 the gain flattens while chance links climb.
+130 mm/s is not a physiological number; it is the knee of a yield-versus-false-link trade, past
+which the gain flattens while chance links climb.
 
 ---
 
@@ -118,12 +135,12 @@ false-link trade. Past ~130 the gain flattens while chance links climb.
 ### What the setting is
 
 `min_track_length` is the last step before results are written: **any track shorter than N frames
-is deleted from the output.** Aleph ships N = 15. We ship N = 8.
+is deleted from the output.** Aleph ships N = 15. We ship N = 10.
 
 The single most important thing to understand about it: **it does not change tracking at all.**
 It is applied only where finished tracks are written out (`tracking.py:343`, `:722`, `:729`) and
 never enters the gate, the assignment cost, or the motion model. A 10-frame track exists inside
-the tracker either way. At N = 15 it is built and then thrown away; at N = 8 it is built and
+the tracker either way. At N = 15 it is built and then thrown away; at N = 10 it is built and
 kept. Lowering it recovers no new associations — it only stops deleting.
 
 So the question is not "does this find more bubbles" (it cannot). The question is: **of the
@@ -144,14 +161,22 @@ many the shuffled data yields. That ratio is the false-track rate at that length
 
 | if we publish tracks of ≥ N frames | tracks published | of those, coincidences |
 |---|---|---|
-| N = 2 | 94,779 | **63%** |
-| N = 5 | 15,810 | 13% |
-| **N = 8 (ours)** | **6,439** | **3.8%** |
-| N = 15 (Aleph's) | 2,118 | 0.4% |
+| N = 2 | 333,722 | **76%** |
+| N = 5 | 61,861 | 21% |
+| N = 8 | 26,889 | 7.3% |
+| **N = 10 (ours)** | **18,393** | **3.9%** |
+| N = 15 (Aleph's) | 9,339 | 0.9% |
+| N = 35 (the headline metric) | 1,784 | **0%** |
 
-Two-frame tracks are mostly noise, as expected. By 8 frames the false rate has dropped to 3.8%
-and the curve has flattened — going from 8 to 15 throws away two thirds of the remaining tracks
-to buy back 3.4 percentage points.
+Two-frame tracks are mostly noise, as expected. By 10 frames the false rate has dropped below 4%
+and the curve has flattened — going from 10 to 15 throws away half the remaining tracks to buy
+back 3 percentage points. Note the last row: at 35 frames the chance count is *zero* out of
+2.17M shuffled detections, which is why tracks ≥35 is the metric used against the reference.
+
+This table is computed **at the gate we ship**. The floor has to be re-derived whenever the gate
+changes: at the tighter gate we first proposed, the 95%-purity knee sat at 8, and carrying that
+8 across to the looser gate would have shipped 92.7% purity while citing a curve that justified
+96%.
 
 We also checked that the extra tracks are not junk by two other routes: planted-crossing link
 precision is flat (0.91–0.96) across the whole range, so the stricter floor buys no accuracy; and
@@ -160,19 +185,19 @@ do not.
 
 ### What it costs and what it buys
 
-- **3.1× more published trajectories** (7,296 → 22,685) and detections linked into tracks rising
-  from 9.2% to 16.7%.
-- **False-track rate 0.4% → 3.8%.** In absolute terms, about 247 of the 22,685 published tracks
-  are expected to be coincidences, against 9 today.
+- **2.5× more published trajectories** (7,296 → 18,393) and detections linked into tracks rising
+  from 9.2% to 16.5%.
+- **False-track rate 0.5% → 3.9%.** In absolute terms, about 712 of the 18,393 published tracks
+  are expected to be coincidences, against 35 today.
 - **The long-track count is untouched**, because a floor at 8 or 15 cannot affect a 35-frame
   track. That is why tracks ≥35 is the metric used for comparison against the reference.
 
 ### The two changes are not independent
 
-A wider gate makes longer chains, which changes where the floor should sit. Quantitatively: at a
-floor of 15, only 1.2% of the gate's link gain is reproduced by the shuffled control; at 8 it is
-11.8%; at 5 it is 28.6%. So the gate's benefit must always be quoted with the floor it was
-measured at — the two settings are reported together, never separately.
+A wider gate makes longer chains, so the floor's knee moves with it — measured, not assumed: at
+the tight 130/130 gate the 95% knee was at 8; at the gate we actually ship it is at **10**. The
+converse holds too: at floor 15 only 1.2% of the gate's link gain is reproduced by the shuffled
+control, at 8 it is 11.8%, at 5 it is 28.6%. Neither setting means anything quoted alone.
 
 ---
 
@@ -211,12 +236,11 @@ harness that silently inherited a 10,000× looser assignment cost than productio
 
 | | Aleph reference | our recreation | with our two changes |
 |---|---|---|---|
-| tracks ≥35 frames | 1,421 | 1,451 | **1,531** |
-| tracks ≥50 frames | — | 582 | **601** |
-| tracks at a matched floor of 15 | 7,274 | 7,296 | **7,808** |
-| tracks at native floor | 50,456 (floor 5) | 7,296 (floor 15) | 22,685 (floor 8) |
-| detections linked into tracks | — | 9.2% | **16.7%** |
-| false-track rate vs shuffled control | never measured | 0.4% | 3.8% |
+| tracks ≥35 frames | 1,421 | 1,451 | **1,784** |
+| tracks ≥50 frames | — | 582 | **717** |
+| tracks at native floor | 50,456 (floor 5) | 7,296 (floor 15) | 18,393 (floor 10) |
+| detections linked into tracks | — | 9.2% | **16.5%** |
+| false-track rate vs shuffled control | never measured | 0.5% | 3.9% |
 
 **No coincidence track anywhere reaches 35 frames** across 2.17M shuffled detections, at either
 setting. The headline population is free of chance chains, so the +80 is not bought with

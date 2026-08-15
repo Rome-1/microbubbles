@@ -136,7 +136,7 @@ def fig3():
     bnull, pnull = r["baseline_null"], r["proposed_null"]
 
     fig, (a, b) = plt.subplots(1, 2, figsize=(9.5, 3.6), constrained_layout=True)
-    names = ["Aleph\nreference", "our\nrecreation", "improved\n(this work)"]
+    names = ["Aleph\nreference", "our\nrecreation", "in-plane gate\n+ floor 10"]
     ge35 = [1421, base["n_ge35"], prop["n_ge35"]]
     bars = a.bar(names, ge35, color=[C_REF, C_BASE, C_IMP], width=.6)
     a.bar_label(bars, fontsize=9)
@@ -144,8 +144,10 @@ def fig3():
     a.set_title("long tracks (immune to the length floor)")
     a.set_ylim(0, max(ge35) * 1.18)
     # the deltas are small; say so on the figure rather than letting equal-looking bars imply more
-    a.annotate("+30 vs reference", (1, ge35[1] * 1.05), ha="center", fontsize=7.5, color=C_BASE)
-    a.annotate("+80 vs recreation\n(+5.5%)", (2, ge35[2] * 1.05), ha="center", fontsize=7.5, color=C_IMP)
+    a.annotate(f"{ge35[1]-ge35[0]:+d} vs reference", (1, ge35[1] * 1.05),
+               ha="center", fontsize=7.5, color=C_BASE)
+    a.annotate(f"{ge35[2]-ge35[1]:+d} vs recreation\n({100*(ge35[2]-ge35[1])/ge35[1]:+.0f}%)",
+               (2, ge35[2] * 1.05), ha="center", fontsize=7.5, color=C_IMP)
     a.set_xlabel("zero chance chains reach 35 frames in 2.17M permuted detections",
                  fontsize=7.5, color="#4b5563", labelpad=8)
 
@@ -158,7 +160,7 @@ def fig3():
     b.bar_label(nb, labels=[f"{bnull['linked_frac']*100:.2f}%", f"{pnull['linked_frac']*100:.2f}%"],
                 fontsize=7.5, color="#4b5563")
     b.bar_label(a2, fmt="%.1f%%", fontsize=9)
-    b.set_xticks(xs, ["recreation\n(Aleph settings)", "improved"])
+    b.set_xticks(xs, ["recreation\n(Aleph settings)", "in-plane gate 130 mm/s\n+ floor 10"])
     b.set_ylabel("detections linked into tracks (%)")
     b.set_title("coverage, with the chance floor beside it")
     b.legend(fontsize=8, frameon=False)

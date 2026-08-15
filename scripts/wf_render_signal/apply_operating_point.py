@@ -40,7 +40,7 @@ MAX_WORKERS = 4
 MAX_COST = 10.0          # production TrackingOptions value, not the function default (1e5)
 
 BASELINE = {"inplane": None, "elev": None, "min_len": 15}      # None => shipped voxel gate
-PROPOSED = {"inplane": 130.0, "elev": 130.0, "min_len": 8}
+PROPOSED = {"inplane": 130.0, "elev": 247.0, "min_len": 10}  # elevation at the Aleph default; floor re-derived for this gate
 
 
 # `_tracking_gate` returns (dx, dy, dz) * 2 with dy = elevation, and `max_dist_mms` is
@@ -122,7 +122,7 @@ def run(cfg, permute_seed=None, label=""):
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     base = run(BASELINE, label="baseline (shipped gate, min_len 15)")
-    prop = run(PROPOSED, label="proposed (130/130 mm/s, min_len 8)")
+    prop = run(PROPOSED, label="proposed (130 in-plane / 247 elev mm/s, min_len 10)")
     base_null = run(BASELINE, permute_seed=7, label="baseline NULL")
     prop_null = run(PROPOSED, permute_seed=7, label="proposed NULL")
 
