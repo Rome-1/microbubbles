@@ -91,7 +91,7 @@ Our first version of this document called the anisotropy "backwards" and tighten
 | **130 / 247 — in-plane only** | **477** |
 
 Tightening elevation gave away 80 of the 105 available long tracks. On the full dataset the same
-choice costs 253 (1,786 against 1,531). Velocity units are the right way to express a *motion*
+choice costs 255 (1,786 against 1,531). Velocity units are the right way to express a *motion*
 limit; they are the wrong way to express a *precision* limit, and elevation is dominated by the
 latter.
 
@@ -122,7 +122,7 @@ along. Physical units are right for a threshold on *motion*. The gate is partly 
 **Raise the in-plane gate to 130 mm/s. Leave elevation exactly as Aleph had it.** One axis, not
 three, via their own `max_dist_mms` — no new code.
 
-**Effect: +335 tracks of ≥35 frames** (1,451 → 1,786, +23%) and +135 of ≥50 frames (582 → 716).
+**Effect: +335 tracks of ≥35 frames** (1,451 → 1,786, +23%) and +134 of ≥50 frames (582 → 716).
 
 130 mm/s is not a physiological number; it is the knee of a yield-versus-false-link trade, past
 which the gain flattens while chance links climb.
