@@ -40,7 +40,7 @@ MAX_WORKERS = 4
 MAX_COST = 10.0          # production TrackingOptions value, not the function default (1e5)
 
 BASELINE = {"inplane": None, "elev": None, "min_len": 15}      # None => shipped voxel gate
-PROPOSED = {"inplane": 130.0, "elev": 247.0, "min_len": 10}  # elevation at the Aleph default; floor re-derived for this gate
+PROPOSED = {"inplane": 130.0, "elev": 246.76, "min_len": 10}  # elevation at the Aleph default; floor re-derived for this gate
 
 
 # `_tracking_gate` returns (dx, dy, dz) * 2 with dy = elevation, and `max_dist_mms` is

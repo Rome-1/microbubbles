@@ -20,8 +20,8 @@ REPO = Path(__file__).resolve().parents[2]
 DET_DIR = REPO / "outputs" / "corrected_full"
 OUT_DIR = REPO / "outputs" / "operating_point" / "tracks"
 FRAME_RATE = 222.4306816130359
-GATE_MMS = (130.0, 130.0, 130.0)          # (x, elevation, z)
-MIN_LEN = 8
+GATE_MMS = (130.0, 246.76, 130.0)        # (x, elevation, z) -- elevation at the Aleph 2-voxel default
+MIN_LEN = 10             # re-derived at this gate (95% purity knee)
 MAX_COST = 10.0
 
 

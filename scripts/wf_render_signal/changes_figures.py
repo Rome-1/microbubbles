@@ -71,7 +71,7 @@ def fig1():
         bins = np.arange(0, 200, 3)
         ax.hist(base[axis], bins=bins, color=C_BASE, alpha=.85, label="Aleph gate (2 voxels/frame)")
         ax.hist(imp[axis], bins=bins, histtype="step", lw=1.6, color=C_IMP,
-                label="physical gate (130 mm/s)")
+                label="ours: 130 mm/s in-plane,\nelevation unchanged")
         # the lobes are integer voxel displacements per frame, not physiological modes:
         # 1 voxel/frame = 44.6 mm/s in-plane, 123.4 in elevation
         step = VOX[axis] * FRAME_RATE
@@ -84,13 +84,13 @@ def fig1():
         ax.annotate(f"{GATE_OLD[axis]:.0f}", (GATE_OLD[axis], ax.get_ylim()[1] * .92),
                     color=C_BASE, fontsize=8, ha="left", va="top", rotation=90)
         if axis != "elevation":
-            ax.axvline(130, color=C_IMP, ls=":", lw=1.2)
+            ax.axvline(130, color=C_IMP, ls=":", lw=1.2)   # elevation is deliberately left alone
         ax.set_yscale("log")
         ax.set_title(f"{axis} step speed")
         ax.set_xlabel("mm/s")
     axes[0].set_ylabel("steps (log)")
     axes[0].legend(fontsize=7.5, frameon=False, loc="upper right")
-    fig.suptitle("Change 2 — the shipped gate censored the speed distribution at its own wall\n"
+    fig.suptitle("Change 1 — the shipped gate censored the IN-PLANE speed distribution at its own wall\n"
                  "(grey lines: integer voxel displacements per frame — the lobes are quantization, not physiology)",
                  fontsize=10.5, y=1.10)
     fig.savefig(OUT / "change_gate_wall.png", bbox_inches="tight", facecolor="white")

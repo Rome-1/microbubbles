@@ -1,7 +1,7 @@
 # From the Aleph baseline to our pipeline: every discrete change
 
 We start from the shipped `alephneuro/microbubbles` pipeline run with its own settings, on the
-corrected 216-acquisition public dataset. **Two settings differ in what we ship.** This document
+corrected 216-acquisition public dataset. **Two settings differ in what we ship** — and only one axis of one of them. This document
 explains each one, what forced it, and what it cost — plus the things we tried and rejected, so
 the ledger is not just a list of wins.
 
@@ -68,8 +68,9 @@ distribution" of the published tracks was a picture of our own gate. Any bubble 
 
 **Reading the figure.** The lobes at 0, ~45 and ~90 mm/s are integer voxel displacements per
 frame (1 voxel/frame = 44.6 mm/s in-plane), not physiological flow modes — sub-voxel localization
-is not smoothing them out. Blue (the shipped gate) stops at the 2-voxel line; orange reaches the
-third lobe. In elevation the change *tightens* the gate, which is why orange stops earlier there.
+is not smoothing them out. Blue (the shipped gate) stops dead at the 2-voxel line in both in-plane panels; orange reaches
+the third lobe. The elevation panel is the control: we change nothing there, so the two curves
+end at the same place and orange simply sits above blue because more tracks are published.
 
 ### Why the elevation gate is *not* a mistake — and why our first recommendation was
 
@@ -90,7 +91,7 @@ Our first version of this document called the anisotropy "backwards" and tighten
 | **130 / 247 — in-plane only** | **477** |
 
 Tightening elevation gave away 80 of the 105 available long tracks. On the full dataset the same
-choice costs 253 (1,784 against 1,531). Velocity units are the right way to express a *motion*
+choice costs 253 (1,786 against 1,531). Velocity units are the right way to express a *motion*
 limit; they are the wrong way to express a *precision* limit, and elevation is dominated by the
 latter.
 
@@ -121,7 +122,7 @@ along. Physical units are right for a threshold on *motion*. The gate is partly 
 **Raise the in-plane gate to 130 mm/s. Leave elevation exactly as Aleph had it.** One axis, not
 three, via their own `max_dist_mms` — no new code.
 
-**Effect: +333 tracks of ≥35 frames** (1,451 → 1,784, +23%) and +135 of ≥50 frames (582 → 717).
+**Effect: +335 tracks of ≥35 frames** (1,451 → 1,786, +23%) and +135 of ≥50 frames (582 → 716).
 
 130 mm/s is not a physiological number; it is the knee of a yield-versus-false-link trade, past
 which the gain flattens while chance links climb.
@@ -164,9 +165,9 @@ many the shuffled data yields. That ratio is the false-track rate at that length
 | N = 2 | 333,722 | **76%** |
 | N = 5 | 61,861 | 21% |
 | N = 8 | 26,889 | 7.3% |
-| **N = 10 (ours)** | **18,393** | **3.9%** |
+| **N = 10 (ours)** | **18,390** | **3.9%** |
 | N = 15 (Aleph's) | 9,339 | 0.9% |
-| N = 35 (the headline metric) | 1,784 | **0%** |
+| N = 35 (the headline metric) | 1,786 | **0%** |
 
 Two-frame tracks are mostly noise, as expected. By 10 frames the false rate has dropped below 4%
 and the curve has flattened — going from 10 to 15 throws away half the remaining tracks to buy
@@ -185,9 +186,9 @@ do not.
 
 ### What it costs and what it buys
 
-- **2.5× more published trajectories** (7,296 → 18,393) and detections linked into tracks rising
+- **2.5× more published trajectories** (7,296 → 18,390) and detections linked into tracks rising
   from 9.2% to 16.5%.
-- **False-track rate 0.5% → 3.9%.** In absolute terms, about 712 of the 18,393 published tracks
+- **False-track rate 0.5% → 3.9%.** In absolute terms, about 712 of the 18,390 published tracks
   are expected to be coincidences, against 35 today.
 - **The long-track count is untouched**, because a floor at 8 or 15 cannot affect a 35-frame
   track. That is why tracks ≥35 is the metric used for comparison against the reference.
@@ -236,9 +237,9 @@ harness that silently inherited a 10,000× looser assignment cost than productio
 
 | | Aleph reference | our recreation | with our two changes |
 |---|---|---|---|
-| tracks ≥35 frames | 1,421 | 1,451 | **1,784** |
-| tracks ≥50 frames | — | 582 | **717** |
-| tracks at native floor | 50,456 (floor 5) | 7,296 (floor 15) | 18,393 (floor 10) |
+| tracks ≥35 frames | 1,421 | 1,451 | **1,786** |
+| tracks ≥50 frames | — | 582 | **716** |
+| tracks at native floor | 50,456 (floor 5) | 7,296 (floor 15) | 18,390 (floor 10) |
 | detections linked into tracks | — | 9.2% | **16.5%** |
 | false-track rate vs shuffled control | never measured | 0.5% | 3.9% |
 
