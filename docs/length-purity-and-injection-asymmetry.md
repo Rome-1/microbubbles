@@ -1,5 +1,13 @@
 # Two settled questions: where temporal persistence starts being informative (A), and whether the injector can adjudicate the axial deficit (B)
 
+> **CORRECTION (2026-08-18).** The floor recommended here (8) was derived at the *default*
+> gate. The gate we ship is wider in-plane, which manufactures longer chance chains and moves
+> the knee: re-measured at 130 mm/s in-plane, 95% purity is crossed at **10**, not 8, and
+> carrying 8 across would have shipped 92.7% purity while citing a curve that justified 96%.
+> The method here is unchanged and is what produced the shipped number — only the value moves.
+> See `docs/from-baseline-to-improved.md` and `outputs/operating_point/purity_curve_130_247.json`.
+
+
 Beads mb-isb (A) and mb-9u0 (B).
 
 - **A** — `python3 scripts/wf_render_signal/length_sweep.py` (local, CPU, ~9 min at 4 workers).

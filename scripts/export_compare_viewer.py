@@ -7,7 +7,7 @@ uses, ``ultratrace_ulm.track_viewer_export.write_tracks_bin_v3``) plus a
 
     data/reference.bin    Aleph reference,      native floor len >= 5
     data/recreation.bin   our 216-acq redo,     native floor len >= 15
-    data/improved.bin     our operating point,  native floor len >= 8
+    data/improved.bin     our operating point,  native floor len >= 10
 
 Each dataset is packed once, at its OWN native floor. The viewer applies any
 higher floor in the shader from the per-track length it already reads out of the
@@ -16,7 +16,7 @@ are the same geometry seen through three cutoffs -- not three different exports
 that could drift apart.
 
 Why the floors matter: the three runs published at different ``min_track_length``
-settings (5, 15, 8). Drawn at their native floors the improved run looks denser
+settings (5, 15, 10). Drawn at their native floors the improved run looks denser
 than the recreation partly because it simply emits shorter tracks, which is a
 publishing choice and not a signal difference. So the viewer DEFAULTS to a
 matched floor of >=15 across all three; the native-floor view is available but
@@ -138,7 +138,7 @@ def main() -> None:
                     help="the Aleph release's own min_track_length")
     ap.add_argument("--recreation-floor", type=int, default=15,
                     help="the recreation run's own min_track_length")
-    ap.add_argument("--improved-floor", type=int, default=8,
+    ap.add_argument("--improved-floor", type=int, default=10,
                     help="the improved operating point's own min_track_length")
     ap.add_argument("--matched-floor", type=int, default=MATCHED_FLOOR,
                     help="like-for-like floor applied to ALL THREE in the default view")
@@ -154,9 +154,9 @@ def main() -> None:
         ("recreation", "RECREATION (ours, 216 acq)", args.recreation_floor,
          lambda: load_batched("recreation", args.recreation_dir, args.recreation_floor),
          99.5),
-        ("improved", "IMPROVED (physical gate)", args.improved_floor,
+        ("improved", "IMPROVED (130 mm/s in-plane, floor 10)", args.improved_floor,
          lambda: load_batched("improved", args.improved_dir, args.improved_floor),
-         95.2),
+         96.1),
     ]
 
     meta = {

@@ -1,5 +1,16 @@
 # The step-speed distribution is censored by our own tracking gate (J1, bead mb-5pd)
 
+> **CORRECTION (2026-08-18).** This report's verdict recommended tightening elevation to
+> 130 mm/s alongside the in-plane widening. That was wrong, and this document's own Tables
+> section contains the evidence: at 130/247 (elevation left at the Aleph default) the sweep
+> gives **477** tracks ≥35 against **397** at 130/130. Tightening elevation gave away 80 of the
+> 105 available long tracks; on the full 216-acquisition dataset it costs 255. A voxel-sized
+> gate scales with per-axis localization uncertainty, and elevation — synthesized from 8
+> physical rows — is dominated by that term, so its wider gate is doing real work. The
+> measurement below stands; only the elevation half of the recommendation is retracted. Shipped
+> configuration and reasoning: `docs/from-baseline-to-improved.md`.
+
+
 Reproduce with `python3 scripts/wf_render_signal/gate_sweep.py` (local, CPU, ~5 min at 4 workers).
 Tables below are its output over batches 0000/0012/0024/0036/0048 of `outputs/corrected_full` —
 **60 acquisitions, 603,254 cached detections**, retracked through the production path

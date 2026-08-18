@@ -1,25 +1,24 @@
 """Apply the settled operating point to all 216 acquisitions and price it honestly.
 
-Two changes survived the J1-J5 program, both measured rather than chosen:
+Two settings differ from the shipped Aleph pipeline, and only one axis of one of them:
 
-  GATE      the tracker's default box gate is 2 voxels/frame, which in physical units is
-            89 mm/s in-plane and 247 mm/s in elevation -- 2.77x looser on the worst-localized
-            axis. Per-step velocities across the 216-acq recreation hard-wall at exactly that
-            value (89.2 / 89.3 / 246.7 observed vs 89.15 / 89.33 / 246.76 predicted), so the
-            speed distribution was censored by our own default. Replaced with a physical,
-            anisotropic 130 / 130 mm/s.
+  GATE      the default box gate is 2 voxels/frame, which in physical units is 89 mm/s in-plane
+            and 247 mm/s in elevation. Per-step velocities across the 216-acq recreation
+            hard-wall at exactly that value (89.2 / 246.7 / 89.3 observed vs 89.15 / 246.76 /
+            89.33 predicted), so the in-plane speed distribution was censored by our own
+            default. We raise the IN-PLANE gate to 130 mm/s and leave elevation alone: voxel
+            size proxies per-axis localization uncertainty, and elevation -- synthesized from 8
+            physical rows -- is dominated by that term. Tightening it to 130 costs 255 tracks
+            >=35 (1,531 against 1,786), which an earlier version of this file did.
 
   FLOOR     `min_track_length` is applied ONLY at emission (tracking.py:343, :722, :729), so it
-            recovers no associations -- it decides what gets published. A purity curve against
-            a frame-permutation null puts the knee at 8: purity clears 95% there and flattens,
-            while 8 -> 15 costs 3x the yield for 3.4 points. The shipped 15 buys no
-            planted-crossing precision (flat 0.91-0.96 across the whole range).
+            recovers no associations -- it decides what gets published. Against a
+            frame-permutation null the 95%-purity knee sits at 10 AT THIS GATE. The knee moves
+            with the gate (it was 8 at the tighter 130/130), so it must be re-derived whenever
+            the gate changes, via purity_curve_at_gate.py.
 
-Both are quoted together because they interact: at L=15 only 1.2% of the gate's link gain is
-null-reproducible, but 11.8% at L=8. A gain figure without its floor is not meaningful.
-
-Baseline here is our own 216-acq recreation of the reference (1,451 tracks >=35 vs the
-reference's 1,421), so the comparison is like-for-like on identical detections.
+Baseline is our own 216-acq recreation of the reference (1,451 tracks >=35 vs the reference's
+1,421), so the comparison is like-for-like on identical detections.
 """
 
 from __future__ import annotations

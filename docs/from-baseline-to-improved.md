@@ -1,9 +1,18 @@
 # From the Aleph baseline to our pipeline: every discrete change
 
 We start from the shipped `alephneuro/microbubbles` pipeline run with its own settings, on the
-corrected 216-acquisition public dataset. **Two settings differ in what we ship** — and only one axis of one of them. This document
-explains each one, what forced it, and what it cost — plus the things we tried and rejected, so
-the ledger is not just a list of wins.
+corrected 216-acquisition public dataset. **Two settings differ in what we ship** — and only one
+axis of one of them. This document explains each, what forced it, and what it cost, plus the
+things we tried and rejected, so the ledger is not just a list of wins.
+
+**The shipped configuration, in one line:** in-plane association gate **130 mm/s** (elevation
+left at the Aleph 2-voxel default), `min_track_length` **10**. Everything else is theirs.
+
+| | Aleph reference | our recreation of it | with our two changes |
+|---|---|---|---|
+| tracks ≥35 frames | 1,421 | 1,451 | **1,786** (+23%) |
+| detections linked into tracks | — | 9.2% | **16.5%** |
+| tracks that are coincidences | never measured | 0.5% | 3.9% |
 
 All numbers are from all 216 acquisitions, on identical detections, with our baseline arm
 reproducing the reference recreation exactly (7,296 tracks / 1,451 ≥35 frames / 582 ≥50).

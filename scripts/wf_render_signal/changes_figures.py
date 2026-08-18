@@ -2,7 +2,7 @@
 result JSONs rather than retyped numbers.
 
 Fig 1  the velocity wall: per-step speed distributions before and after the gate change.
-Fig 2  the purity curve: why min_track_length is 8 and not 5, 15, or 2.
+Fig 2  the purity curve at the shipped gate: why min_track_length is 10.
 Fig 3  what each change bought: long tracks and linked detections, with the null alongside.
 """
 
@@ -99,35 +99,44 @@ def fig1():
 
 
 def fig2():
-    d = json.load(open(REPO / "outputs/length_sweep/length_sweep.json"))
-    rows = d["purity"]["default"]                     # null = frame-order permutation
-    Ls = [int(r["L"]) for r in rows]
-    real = np.array([r["n_real"] for r in rows], float)
-    null = np.array([r["n_null"] for r in rows], float)
+    """Purity curve AT THE GATE WE SHIP. The knee moves with the gate -- at the tighter
+    130/130 we first proposed it sat at 8; at the shipped gate it is 10 -- so this must be
+    sourced from the matching sweep, never from the default-gate curve."""
+    d = json.load(open(REPO / "outputs" / "operating_point" / "purity_curve_130_247.json"))
+    rows = [r for r in d["rows"] if r["L"] <= 20]
+    Ls = [r["L"] for r in rows]
+    real = np.array([r["real"] for r in rows], float)
+    null = np.array([r["null"] for r in rows], float)
     pur = np.array([r["purity"] for r in rows], float)
+    knee = 10
 
     fig, (a, b) = plt.subplots(1, 2, figsize=(9.5, 3.4), constrained_layout=True)
     a.plot(Ls, pur * 100, color=C_IMP, lw=1.8)
     a.axhline(95, color=C_NULL, ls="--", lw=1)
-    a.axvline(8, color=C_IMP, ls=":", lw=1.2)
+    a.axvline(knee, color=C_IMP, ls=":", lw=1.2)
     a.axvline(15, color=C_BASE, ls=":", lw=1.2)
-    a.annotate("chosen: 8\n96.2%", (8, 60), fontsize=8, color=C_IMP, ha="left")
-    a.annotate("Aleph default: 15\n99.6%", (15.4, 40), fontsize=8, color=C_BASE, ha="left")
-    a.set_xlabel("min_track_length"); a.set_ylabel("purity vs permutation null (%)")
-    a.set_title("purity clears 95% at 8 and flattens")
+    a.annotate(f"ours: {knee}\n{pur[Ls.index(knee)]*100:.1f}%", (knee + .3, 55),
+               fontsize=8, color=C_IMP, ha="left")
+    a.annotate(f"Aleph default: 15\n{pur[Ls.index(15)]*100:.1f}%", (15.3, 30),
+               fontsize=8, color=C_BASE, ha="left")
+    a.set_xlabel("min_track_length"); a.set_ylabel("real tracks that are not chance (%)")
+    a.set_title("purity clears 95% at 10 and flattens")
     a.set_ylim(0, 102)
 
     b.semilogy(Ls, real, color=C_IMP, lw=1.8, label="real detections")
-    b.semilogy(Ls, np.maximum(null, .5), color=C_NULL, lw=1.4, ls="--", label="frame-permuted null")
-    b.axvline(8, color=C_IMP, ls=":", lw=1.2); b.axvline(15, color=C_BASE, ls=":", lw=1.2)
-    b.set_xlabel("min_track_length"); b.set_ylabel("tracks emitted (log)")
-    b.set_title("yield: 8 → 15 costs 3× for 3.4 points")
+    b.semilogy(Ls, np.maximum(null, .5), color=C_NULL, lw=1.4, ls="--",
+               label="frame-shuffled control")
+    b.axvline(knee, color=C_IMP, ls=":", lw=1.2); b.axvline(15, color=C_BASE, ls=":", lw=1.2)
+    b.set_xlabel("min_track_length"); b.set_ylabel("tracks published (log)")
+    b.set_title(f"yield: {knee} → 15 halves the output for 3 points")
     b.legend(fontsize=8, frameon=False)
-    fig.suptitle("Change 3 — the length floor is an emission dial, so it is calibrated, not chosen",
-                 fontsize=11, y=1.06)
+    fig.suptitle("Change 2 — the length floor decides what is published, so it is calibrated\n"
+                 "against a control in which every track is a coincidence (gate: 130 mm/s in-plane)",
+                 fontsize=10.5, y=1.10)
     fig.savefig(OUT / "change_length_purity.png", bbox_inches="tight", facecolor="white")
     plt.close(fig)
-    return {"purity_at_8": float(pur[Ls.index(8)]), "purity_at_15": float(pur[Ls.index(15)])}
+    return {"knee": knee, "purity_at_knee": float(pur[Ls.index(knee)]),
+            "purity_at_15": float(pur[Ls.index(15)])}
 
 
 def fig3():
